@@ -1,0 +1,13 @@
+[package]
+name = "rt809h-core"
+description = "Driver library for the RT809H universal programmer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nusb = "0.2"
+thiserror = "2"
+log = "0.4"
