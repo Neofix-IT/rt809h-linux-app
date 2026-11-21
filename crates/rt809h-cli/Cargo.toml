@@ -1,0 +1,18 @@
+[package]
+name = "rt809h-cli"
+description = "Command line tool for the RT809H universal programmer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rt809h"
+path = "src/main.rs"
+
+[dependencies]
+rt809h-core = { path = "../rt809h-core" }
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+indicatif = "0.17"
