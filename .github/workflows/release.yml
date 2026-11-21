@@ -63,7 +63,7 @@ jobs:
           useradd -m builder
           mkdir -p /tmp/pkg && cp packaging/arch/* /tmp/pkg/
           sed -i "s/^pkgver=.*/pkgver=$v/" /tmp/pkg/PKGBUILD
-          git archive --format=tar.gz --prefix=rth809h-linux-app-$v/ -o /tmp/pkg/rt809h-$v.tar.gz HEAD
+          git archive --format=tar.gz --prefix=rt809h-linux-app-$v/ -o /tmp/pkg/rt809h-$v.tar.gz HEAD
           chown -R builder /tmp/pkg
           su builder -c "cd /tmp/pkg && makepkg --noconfirm --nodeps"
           mkdir -p dist && cp /tmp/pkg/*.pkg.tar.zst dist/

@@ -23,7 +23,7 @@ to the bottom of the socket). See `rt809h chips` for the database.
 ## Install
 
 Download the package for your distribution from the
-[releases page](https://github.com/Neofix-IT/rth809h-linux-app/releases):
+[releases page](https://github.com/Neofix-IT/rt809h-linux-app/releases):
 
 ```bash
 sudo apt install ./rt809h_*_amd64.deb      # Debian / Ubuntu
