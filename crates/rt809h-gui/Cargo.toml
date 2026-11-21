@@ -1,0 +1,43 @@
+[package]
+name = "rt809h-gui"
+description = "Simple desktop app for the RT809H universal programmer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rt809h-gui"
+path = "src/main.rs"
+
+[dependencies]
+rt809h-core = { path = "../rt809h-core" }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "clipboard"] }
+rfd = "0.18"
+env_logger = "0.11"
+log = "0.4"
+
+[package.metadata.deb]
+name = "rt809h"
+maintainer = "Neofix <info@neofix.ch>"
+copyright = "2026, Neofix"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+Native Linux application and command line tool for the RT809H universal \
+programmer: chip auto-detection with safe voltage ramping (1.8/2.5/3.3 V), \
+socket contact check, read, write, verify, erase and blank check of \
+25-series SPI NOR flash."""
+section = "electronics"
+priority = "optional"
+depends = "$auto, libxkbcommon-x11-0, libgl1, libegl1"
+recommends = "xdg-desktop-portal"
+maintainer-scripts = "../../packaging/debian"
+assets = [
+    ["target/release/rt809h-gui", "usr/bin/", "755"],
+    ["target/release/rt809h", "usr/bin/", "755"],
+    ["../../packaging/udev/60-rt809h.rules", "usr/lib/udev/rules.d/", "644"],
+    ["../../packaging/linux/rt809h.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/linux/rt809h.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["../../README.md", "usr/share/doc/rt809h/README.md", "644"],
+]
