@@ -5,12 +5,30 @@
 //!
 //! Wire format (little endian): request = op:u8 ch:u8 len:u32 payload,
 //! response = status:u32 len:u32 payload.
+//!
+//! Compatibility fix: some host software sends the SPI socket command (`52`)
+//! and the matching power-off (`01`) with mode byte bit 7 clear, which leaves
+//! the socket disconnected. The bridge sets that bit on the way out and
+//! restores the original frame in the MCU's echo.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use rt809h_core::ftdi::{self, Ftdi};
+use rt809h_core::protocol::frame;
+
+/// Set bit 7 of the mode byte in SPI `52`/`01` frames. Returns the frame to
+/// send and, if it was changed, the original.
+fn fix_spi_mode(p: &[u8]) -> Option<[u8; 10]> {
+    if p.len() != 10 || p[0] != 0xAA || !matches!(p[1], 0x52 | 0x01) {
+        return None;
+    }
+    if p[5..] != [1, 1, 1, 1, 1] || p[3] & 0x80 != 0 {
+        return None;
+    }
+    Some(frame(p[1], p[2], p[3] | 0x80, [1, 1, 1, 1, 1]))
+}
 
 fn hex(b: &[u8]) -> String {
     b.iter()
@@ -41,6 +59,8 @@ fn main() {
 fn serve(mut s: TcpStream) -> std::io::Result<()> {
     s.set_nodelay(true)?;
     let mut chans: [Option<Ftdi>; 2] = [None, None];
+    // (echo as the MCU will send it, echo the host expects)
+    let mut echo_fix: Option<([u8; 10], [u8; 10])> = None;
     let t0 = Instant::now();
     loop {
         let mut hdr = [0u8; 6];
@@ -109,14 +129,31 @@ fn serve(mut s: TcpStream) -> std::io::Result<()> {
                             println!("{ts:9.4} [{ch}] LATENCY {}", p[0]);
                         }
                         8 => {
-                            f.write(&p)?;
+                            if let Some(fixed) = fix_spi_mode(&p) {
+                                let mut want: [u8; 10] = p[..].try_into().unwrap();
+                                want[0] = 0x55;
+                                let mut got = fixed;
+                                got[0] = 0x55;
+                                echo_fix = Some((got, want));
+                                println!("{ts:9.4} [{ch}] FIX mode byte -> {}", hex(&fixed));
+                                f.write(&fixed)?;
+                            } else {
+                                f.write(&p)?;
+                            }
                             out.extend_from_slice(&(p.len() as u32).to_le_bytes());
                             println!("{ts:9.4} [{ch}] WRITE {}: {}", p.len(), hex(&p));
                         }
                         9 => {
                             let n = u32le(&p) as usize;
                             let to = u32le(&p[4..]);
-                            let d = f.read_timeout(n, Duration::from_millis(to.max(1) as u64))?;
+                            let mut d =
+                                f.read_timeout(n, Duration::from_millis(to.max(1) as u64))?;
+                            if let Some((got, want)) = echo_fix {
+                                if d.len() >= 10 && d[..10] == got {
+                                    d[..10].copy_from_slice(&want);
+                                    echo_fix = None;
+                                }
+                            }
                             println!("{ts:9.4} [{ch}] READ {}/{}: {}", d.len(), n, hex(&d));
                             out = d;
                         }
