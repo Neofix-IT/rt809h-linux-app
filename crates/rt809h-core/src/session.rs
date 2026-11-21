@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::chips::{self, Chip};
 use crate::ftdi::{self, DeviceEntry};
-use crate::protocol::{ContactReport, Mcu, Voltage};
+use crate::protocol::{zif_pin_8, ContactReport, Mcu, Voltage};
 use crate::spi::{self, Flash, FlashGeometry, JedecId, SpiBus};
 use crate::{Error, Result};
 
@@ -110,33 +110,44 @@ impl Programmer {
         let r = self.contact_test(v)?;
         log::debug!("contact scan {:02X?}", r.raw);
         if r.socket_empty() {
-            return Ok(Some("No chip detected in the socket.".into()));
-        }
-        if r.reversed(8) {
             return Ok(Some(
-                "The chip is inserted the wrong way round. Pin 1 (dot) must point to the lever, at socket pin 21.".into(),
+                "No chip detected. Check that a chip is inserted and the lever is closed.".into(),
             ));
         }
-        let bad = r.check_bottom_aligned(8);
-        if !bad.is_empty() {
-            let list: Vec<String> = bad
+        let Some(p) = r.locate_8pin() else {
+            return Ok(Some(format!(
+                "No 8-pin chip found at the bottom of the socket (contact at socket pins {:?}).",
+                r.connected_pins()
+            )));
+        };
+        if !p.missing.is_empty() {
+            let list: Vec<String> = p
+                .missing
                 .iter()
-                .map(|z| format!("chip pin {} (socket pin {z})", zif_to_pkg8(*z)))
+                .map(|&c| format!("chip pin {c} (socket pin {})", zif_pin_8(p.row, c)))
                 .collect();
-            return Ok(Some(format!("Poor contact: {}.", list.join(", "))));
+            let mut msg = format!("Poor contact: {}.", list.join(", "));
+            if p.row != 21 {
+                msg.push_str(" Push the chip to the bottom of the socket.");
+            }
+            return Ok(Some(msg));
         }
-        if r.misplaced(8) {
-            return Ok(Some(
-                "Something is connected outside the bottom 8 socket pins. Push the chip to the bottom of the socket.".into(),
-            ));
+        if p.row != 21 {
+            return Ok(Some(format!(
+                "The chip sits {} row(s) too high. Push it to the bottom of the socket.",
+                21 - p.row
+            )));
         }
         Ok(None)
     }
 
+    /// Power the socket at `v` and hand it to the SPI engine, following the
+    /// vendor order: rails, contact scan, mode switch.
     fn power_spi(&mut self, v: Voltage) -> Result<()> {
         self.mcu.set_rails(v, v)?;
-        self.mcu.enter_spi(0)?;
-        std::thread::sleep(Duration::from_millis(5));
+        self.mcu.contact_test()?;
+        self.mcu.enter_spi()?;
+        std::thread::sleep(Duration::from_millis(20));
         Ok(())
     }
 
@@ -308,10 +319,6 @@ impl Programmer {
         off?;
         Ok(v)
     }
-}
-
-fn zif_to_pkg8(z: u8) -> u8 {
-    z - 20
 }
 
 /// Compare two buffers, returning the first differing offset.

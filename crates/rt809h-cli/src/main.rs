@@ -141,7 +141,6 @@ fn run(cli: Cli) -> Result<()> {
             let v = cli.voltage.get().unwrap_or(Voltage::V1_8);
             let r = p.contact_test(v)?;
             println!("Pins with contact: {:?}", r.connected_pins());
-            println!("Ground detected at socket pin(s): {:?}", r.ground_pins);
             match p.check_contact_8pin(v)? {
                 Some(problem) => return Err(Error::Chip(problem)),
                 None => println!("8-pin chip: contact OK"),

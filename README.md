@@ -12,7 +12,7 @@ driven directly over USB (pure Rust, no libusb/libftdi needed).
   the chip is then driven at its rated voltage from the built-in database
 - Manual voltage selection (1.8 / 2.5 / 3.3 V) and manual chip selection
 - **Socket contact check** before every operation: reports loose pins, an empty
-  socket, a chip placed too high and a chip inserted the wrong way round
+  socket and a chip placed too high
 - Read, write (erase + program + verify), verify, erase, blank check
 - Unknown chips are handled through SFDP / JEDEC capacity
 - Simple English GUI with hex preview, plus a scriptable CLI
@@ -46,8 +46,8 @@ sudo cp 60-rt809h.rules /etc/udev/rules.d/ && sudo udevadm control --reload && s
 
 ## Using it
 
-Put the chip at the **bottom** of the ZIF socket with **pin 1 on the lever
-side** (chip pin 1 = socket pin 21). Then press **Detect**, **Read** or
+Put the chip at the **bottom** of the ZIF socket with **pin 1 (dot) pointing
+to the top of the socket** (chip pin 1 = socket pin 21). Then press **Detect**, **Read** or
 **Write** in the app, or use the CLI:
 
 ```bash

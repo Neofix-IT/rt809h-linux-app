@@ -28,6 +28,10 @@ pub const CMD_DEVICE_INFO: u8 = 0xF5;
 
 const PAD: [u8; 5] = [0xCD; 5];
 
+/// Mode byte of `CMD_SET_MODE` that hands the socket to the MPSSE SPI
+/// engine. Without bit 7 the SPI lines stay disconnected (reads return 0).
+const SPI_MODE: u8 = 0xC0;
+
 /// Build a command frame with a valid check byte.
 pub fn frame(cmd: u8, p1: u8, p2: u8, tail: [u8; 5]) -> [u8; 10] {
     let mut f = [
@@ -74,7 +78,7 @@ impl Voltage {
         match self {
             Voltage::V1_8 => 0xE0,
             Voltage::V2_5 => 0xD2,
-            Voltage::V3_3 => 0xBE,
+            Voltage::V3_3 => 0xC2,
         }
     }
 
@@ -94,109 +98,79 @@ impl std::fmt::Display for Voltage {
 }
 
 /// Result of the socket contact test.
+///
+/// Bytes 8..16 of the reply hold a little-endian contact map of the bottom
+/// eight socket rows: bit `k` (0..8) is ZIF pin `25 + k` (right column,
+/// counted from the bottom up) and bit `8 + k` is ZIF pin `17 + k` (left
+/// column, top down). A cleared bit means a chip pin was detected.
 #[derive(Debug, Clone)]
 pub struct ContactReport {
-    /// Three per-pin scans of the 48 pin ZIF socket (bit set = no contact).
-    pub scans: [u64; 3],
-    /// Socket pins the programmer identified as the chip's ground pin.
-    pub ground_pins: Vec<u8>,
-    /// Second pin group reported by the scan (purpose not fully known).
-    pub other_pins: Vec<u8>,
+    pub map: u64,
     pub raw: Vec<u8>,
 }
 
+/// Where an 8-pin package was found in the socket.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Placement8 {
+    /// ZIF pin under chip pin 1 (21 = bottom of the socket).
+    pub row: u8,
+    /// Chip pins (1..=8) without contact.
+    pub missing: Vec<u8>,
+}
+
 impl ContactReport {
-    fn parse(raw: Vec<u8>) -> Result<Self> {
-        if raw.len() < 30 {
+    pub fn parse(raw: Vec<u8>) -> Result<Self> {
+        if raw.len() < 16 {
             return Err(Error::Protocol("short contact report".into()));
         }
-        let mut scans = [0u64; 3];
-        for (i, s) in scans.iter_mut().enumerate() {
-            let b = &raw[i * 6..i * 6 + 6];
-            *s = b.iter().fold(0u64, |acc, &x| (acc << 8) | x as u64);
-        }
-        let group = |o: usize| -> Vec<u8> {
-            let n = (raw[o] as usize).min(5);
-            raw[o + 1..o + 1 + n]
-                .iter()
-                .copied()
-                .filter(|p| (1..=48).contains(p))
-                .collect()
-        };
-        let ground_pins = group(18);
-        let other_pins = group(24);
-        Ok(Self {
-            scans,
-            ground_pins,
-            other_pins,
-            raw,
-        })
+        let map = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+        Ok(Self { map, raw })
     }
 
-    /// True if ZIF pin `pin` (1..=48) showed a connection in a scan.
-    fn seen(scan: u64, pin: u8) -> bool {
-        scan & (1u64 << (pin - 1)) == 0
-    }
-
-    /// A pin is considered contacted when either of the first two scans
-    /// sees it.
-    pub fn pin_ok(&self, pin: u8) -> bool {
-        Self::seen(self.scans[0], pin) || Self::seen(self.scans[1], pin)
-    }
-
-    /// ZIF pins that show any connection.
+    /// ZIF pins (17..=32) where a chip pin was detected.
     pub fn connected_pins(&self) -> Vec<u8> {
-        (1..=48).filter(|&p| self.pin_ok(p)).collect()
+        let mut pins: Vec<u8> = (0..8)
+            .filter(|k| self.map & (1 << (8 + k)) == 0)
+            .map(|k| 17 + k as u8)
+            .chain(
+                (0..8)
+                    .filter(|k| self.map & (1 << k) == 0)
+                    .map(|k| 25 + k as u8),
+            )
+            .collect();
+        pins.sort_unstable();
+        pins
     }
 
-    /// True if nothing at all is detected in the socket.
     pub fn socket_empty(&self) -> bool {
         self.connected_pins().is_empty()
     }
 
-    /// Check the pins of a DIP/SOIC package with `pins` pins that is pushed
-    /// to the bottom of the socket (the RT809H convention). Returns the ZIF
-    /// numbers of pins without contact.
-    pub fn check_bottom_aligned(&self, pins: u8) -> Vec<u8> {
-        zif_pins_bottom_aligned(pins)
-            .into_iter()
-            .filter(|&p| !self.pin_ok(p))
-            .collect()
-    }
-
-    /// True if a bottom-aligned package with `pins` pins looks rotated by
-    /// 180 degrees (ground found where the supply pin should be).
-    pub fn reversed(&self, pins: u8) -> bool {
-        let gnd = package_to_zif(pins, pins / 2);
-        let vcc = package_to_zif(pins, pins);
-        self.ground_pins.contains(&vcc) && !self.ground_pins.contains(&gnd)
-    }
-
-    /// True if something is connected outside the area a bottom-aligned
-    /// package with `pins` pins would occupy (chip placed too high).
-    pub fn misplaced(&self, pins: u8) -> bool {
-        let expected = zif_pins_bottom_aligned(pins);
-        self.connected_pins().iter().any(|p| !expected.contains(p))
+    /// Best matching position of an 8-pin package, or `None` if nothing
+    /// resembling one is in the socket.
+    pub fn locate_8pin(&self) -> Option<Placement8> {
+        let pins = self.connected_pins();
+        let mut best: Option<(usize, Placement8)> = None;
+        for row in 17..=21u8 {
+            let missing: Vec<u8> = (1..=8)
+                .filter(|&p| !pins.contains(&zif_pin_8(row, p)))
+                .collect();
+            let hits = 8 - missing.len();
+            if best.as_ref().is_none_or(|(h, _)| hits > *h) {
+                best = Some((hits, Placement8 { row, missing }));
+            }
+        }
+        best.filter(|(h, _)| *h >= 5).map(|(_, p)| p)
     }
 }
 
-/// ZIF socket pin numbers occupied by a bottom-aligned DIP package.
-///
-/// ZIF pins 1..24 run down the left column, 25..48 back up the right one.
-pub fn zif_pins_bottom_aligned(pins: u8) -> Vec<u8> {
-    let half = pins / 2;
-    let left = (24 - half + 1)..=24;
-    let right = 25..=(24 + half);
-    left.chain(right).collect()
-}
-
-/// Map a package pin (1-based, DIP numbering) to its ZIF pin.
-pub fn package_to_zif(pins: u8, pkg_pin: u8) -> u8 {
-    let half = pins / 2;
-    if pkg_pin <= half {
-        24 - half + pkg_pin
+/// ZIF pin under package pin `pin` (1..=8) of an 8-pin chip whose pin 1 sits
+/// at ZIF pin `row` (pin 1 towards the top of the socket).
+pub fn zif_pin_8(row: u8, pin: u8) -> u8 {
+    if pin <= 4 {
+        row + pin - 1
     } else {
-        24 + (pkg_pin - half)
+        49 - (row + 8 - pin)
     }
 }
 
@@ -218,9 +192,10 @@ impl Mcu {
     fn sync(&mut self) -> Result<()> {
         self.ftdi.set_bitmode(0xFF, BitMode::Mpsse)?;
         self.ftdi.write(&[0x82, 0x00, 0x40])?;
+        std::thread::sleep(Duration::from_millis(3));
         self.ftdi.write(&[0x82, 0xFF, 0x00])?;
         self.ftdi.set_bitmode(0xFF, BitMode::Reset)?;
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(50));
         Ok(())
     }
 
@@ -318,30 +293,27 @@ impl Mcu {
         ContactReport::parse(self.ftdi.read_exact(48)?)
     }
 
-    /// Route the socket to the FTDI SPI lines (25-series serial flash).
-    pub fn enter_spi(&mut self, size_code: u8) -> Result<()> {
-        self.command(CMD_SET_MODE, 0x00, size_code, [1, 1, 1, 1, 1])
+    /// Connect the socket to the FTDI SPI lines (25-series serial flash).
+    pub fn enter_spi(&mut self) -> Result<()> {
+        self.command(CMD_SET_MODE, 0x00, SPI_MODE, [1, 1, 1, 1, 1])
     }
 
-    /// Route the socket for I2C (24-series EEPROM).
-    pub fn enter_i2c(&mut self) -> Result<()> {
-        self.command(CMD_SET_MODE, 0x00, 0x00, [1, 0, 0, 0, 0])
-    }
-
-    /// Switch the chip supply off and release the socket.
+    /// Switch the chip supply off and release the socket. `spi` must be
+    /// true if `enter_spi` was used since the rails were switched on.
     pub fn power_off(&mut self, spi: bool) -> Result<()> {
-        let t = if spi {
-            [1, 1, 1, 1, 1]
+        if spi {
+            self.command_noack(CMD_POWER_OFF, 0x00, SPI_MODE, [1, 1, 1, 1, 1])?;
         } else {
-            [1, 0, 0, 0, 0]
-        };
-        self.command_noack(CMD_POWER_OFF, 0x00, 0x00, t)?;
-        std::thread::sleep(Duration::from_millis(30));
-        let _ = self.ftdi.read_available(Duration::from_millis(5));
+            self.command_noack(CMD_POWER_OFF, 0x00, 0x00, [0, 0, 0, 0, 0x14])?;
+        }
         self.ftdi.set_bitmode(0xFF, BitMode::Mpsse)?;
         self.ftdi.write(&[0x82, 0x00, 0x80])?;
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(10));
+        self.ftdi.write(&[0x82, 0xFF, 0x00])?;
         self.ftdi.set_bitmode(0xFF, BitMode::Reset)?;
+        std::thread::sleep(Duration::from_millis(50));
+        self.ftdi.purge()?;
+        let _ = self.ftdi.read_available(Duration::from_millis(5));
         Ok(())
     }
 }
@@ -408,25 +380,38 @@ mod tests {
 
     #[test]
     fn contact_mapping() {
-        // Real scan of a SOIC-8 in the bottom of the socket with ZIF pin 25
-        // not touching.
-        // not touching; this chip was also inserted rotated by 180 degrees.
-        let raw = hex("ff ff f1 1f ff ff ff ff f1 1f ff ff ff ff ff 7f ff ff 01 1c 00 00 00 00 02 18 19 00 00 00");
-        let r = ContactReport::parse(raw).unwrap();
         assert_eq!(
-            zif_pins_bottom_aligned(8),
+            (1..=8).map(|p| zif_pin_8(21, p)).collect::<Vec<_>>(),
             vec![21, 22, 23, 24, 25, 26, 27, 28]
         );
-        assert_eq!(r.check_bottom_aligned(8), vec![21, 25]);
-        assert!(!r.misplaced(8));
-        assert!(r.reversed(8));
-        // correctly inserted W25Q128
-        let good = hex("ff ff f0 1f ff ff ff ff f0 0f ff ff ff ff f0 9f ff ff 01 18 00 00 00 00 01 15 00 00 00 00");
+        // W25Q64 seated correctly at the bottom of the socket
+        let good = hex("ff ff f1 0f ff ff ff ff f0 0f ff ff ff ff ff 7f ff ff 01 1c 00 00 00 00 02 18 19 00 00 00");
         let r = ContactReport::parse(good).unwrap();
-        assert!(r.check_bottom_aligned(8).is_empty());
-        assert!(!r.reversed(8));
-        assert_eq!(package_to_zif(8, 1), 21);
-        assert_eq!(package_to_zif(8, 8), 28);
+        assert_eq!(r.connected_pins(), vec![21, 22, 23, 24, 25, 26, 27, 28]);
+        assert_eq!(
+            r.locate_8pin(),
+            Some(Placement8 {
+                row: 21,
+                missing: vec![]
+            })
+        );
+        // same chip moved up one row, chip pin 4 (ZIF 23) without contact
+        let mut moved = vec![0xff; 30];
+        moved[8..16].copy_from_slice(&0xFFFF_FFFF_FFFF_C7E1u64.to_le_bytes());
+        let r = ContactReport::parse(moved).unwrap();
+        assert_eq!(r.connected_pins(), vec![20, 21, 22, 26, 27, 28, 29]);
+        assert_eq!(
+            r.locate_8pin(),
+            Some(Placement8 {
+                row: 20,
+                missing: vec![4]
+            })
+        );
+        // chip pins 1 and 5 not touching
+        let poor = hex("ff ff f1 1f ff ff ff ff f1 1f ff ff ff ff ff 7f ff ff 01 1c 00 00 00 00 02 18 19 00 00 00");
+        let r = ContactReport::parse(poor).unwrap();
+        assert_eq!(r.locate_8pin().unwrap().missing, vec![1, 5]);
+        assert!(ContactReport::parse(vec![0xff; 48]).unwrap().socket_empty());
     }
 
     fn hex(s: &str) -> Vec<u8> {
