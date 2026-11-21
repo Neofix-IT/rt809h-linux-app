@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  debian:
+    # oldest supported base keeps the glibc requirement low (Debian 12 / Ubuntu 22.04+)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check version matches tag
+        run: |
+          v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="rt809h-gui") | .version')
+          test "v$v" = "$TAG" || { echo "Cargo version v$v does not match tag $TAG"; exit 1; }
+      - run: cargo test --locked
+      - run: cargo build --release --locked --bins
+      - run: cargo install cargo-deb --locked
+      - name: Build .deb
+        run: cargo deb -p rt809h-gui --no-build --output dist/
+      - name: Build portable tarball
+        run: |
+          v=${TAG#v}
+          d=rt809h-$v-linux-x86_64
+          mkdir -p $d
+          cp target/release/rt809h target/release/rt809h-gui $d/
+          cp packaging/udev/60-rt809h.rules packaging/linux/rt809h.desktop packaging/linux/rt809h.svg README.md LICENSE $d/
+          tar czf dist/$d.tar.gz $d
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debian
+          path: dist/*
+
+  arch:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install build tools
+        run: pacman -Syu --noconfirm --needed git rust libxkbcommon-x11 libglvnd
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Build package
+        run: |
+          v=${TAG#v}
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          useradd -m builder
+          mkdir -p /tmp/pkg && cp packaging/arch/* /tmp/pkg/
+          sed -i "s/^pkgver=.*/pkgver=$v/" /tmp/pkg/PKGBUILD
+          git archive --format=tar.gz --prefix=rth809h-linux-app-$v/ -o /tmp/pkg/rt809h-$v.tar.gz HEAD
+          chown -R builder /tmp/pkg
+          su builder -c "cd /tmp/pkg && makepkg --noconfirm --nodeps"
+          mkdir -p dist && cp /tmp/pkg/*.pkg.tar.zst dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch
+          path: dist/*
+
+  publish:
+    needs: [debian, arch]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release notes
+        run: |
+          v=${TAG#v}
+          awk -v v="$v" '$0 ~ "^## \\[?"v"\\]?" {f=1; next} /^## / {f=0} f' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "Release $TAG" > notes.md
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          body_path: notes.md
+          files: dist/*

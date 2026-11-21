@@ -1,0 +1,48 @@
+# Maintainer: Neofix <info@neofix.ch>
+pkgname=rt809h
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Native Linux app and CLI for the RT809H universal programmer (SPI flash)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Neofix-IT/rth809h-linux-app"
+license=('MIT')
+depends=('gcc-libs' 'glibc' 'libxkbcommon-x11' 'libglvnd')
+optdepends=('xdg-desktop-portal: native file dialogs')
+makedepends=('cargo')
+install=rt809h.install
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+_srcdir() {
+    find "$srcdir" -maxdepth 1 -mindepth 1 -type d -name '*rt*809h*' | head -n1
+}
+
+prepare() {
+    cd "$(_srcdir)"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$(_srcdir)"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release --bins
+}
+
+check() {
+    cd "$(_srcdir)"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo test --frozen --release -p rt809h-core
+}
+
+package() {
+    cd "$(_srcdir)"
+    install -Dm755 target/release/rt809h-gui "$pkgdir/usr/bin/rt809h-gui"
+    install -Dm755 target/release/rt809h "$pkgdir/usr/bin/rt809h"
+    install -Dm644 packaging/udev/60-rt809h.rules "$pkgdir/usr/lib/udev/rules.d/60-rt809h.rules"
+    install -Dm644 packaging/linux/rt809h.desktop "$pkgdir/usr/share/applications/rt809h.desktop"
+    install -Dm644 packaging/linux/rt809h.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/rt809h.svg"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

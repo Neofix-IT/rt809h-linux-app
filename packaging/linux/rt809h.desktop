@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=RT809H Programmer
+GenericName=Flash Programmer
+Comment=Read, write and verify SPI flash chips with the RT809H programmer
+Exec=rt809h-gui
+Icon=rt809h
+Terminal=false
+Categories=Development;Electronics;
+Keywords=programmer;flash;spi;eeprom;bios;rt809h;
+StartupWMClass=rt809h-linux
