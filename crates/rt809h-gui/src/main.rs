@@ -159,6 +159,9 @@ impl App {
             scroll_to_row: None,
         };
         app.start("Connecting", Job::Connect);
+        if let Some(path) = std::env::args_os().nth(1) {
+            app.load_path(std::path::Path::new(&path));
+        }
         app
     }
 
@@ -918,15 +921,17 @@ impl App {
                 head.push_str(" ASCII");
                 let mut job = LayoutJob::default();
                 job.append(&head, 0.0, TextFormat::simple(mono.clone(), p.faint));
-                paint_row(ui, row_h + 4.0, job);
+                paint_row(ui, row_h + 6.0, job);
                 let mut area = egui::ScrollArea::vertical()
                     .id_salt("hex")
                     .auto_shrink([false, false]);
                 if let Some(r) = self.scroll_to_row.take() {
                     area = area.vertical_scroll_offset(r as f32 * row_h);
                 }
+                // rows are packed without gaps; show_rows must know that, or it
+                // reserves space for gaps and leaves the bottom of the view empty
+                ui.spacing_mut().item_spacing.y = 0.0;
                 area.show_rows(ui, row_h, rows, |ui, range| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
                     for r in range {
                         let off = r * 16;
                         let line = &data[off..(off + 16).min(data.len())];
