@@ -480,9 +480,12 @@ impl App {
                 None => "Auto detect".into(),
             };
             let width = ui.available_width();
+            // keep the popup below the box: size it to the room that is left
+            let below = ui.ctx().content_rect().bottom() - ui.cursor().top() - 60.0;
+            let list_h = (below - 56.0).clamp(140.0, 380.0);
             let popup = egui::ComboBox::from_id_salt("chip_sel")
                 .width(width)
-                .height(440.0)
+                .height(list_h + 56.0)
                 .selected_text(label)
                 // clicks inside (e.g. into the search field) must not close it
                 .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
@@ -511,7 +514,7 @@ impl App {
                     ui.add_space(4.0);
                     egui::ScrollArea::vertical()
                         .id_salt("chip_list")
-                        .max_height(380.0)
+                        .max_height(list_h)
                         .show(ui, |ui| {
                             if ui
                                 .selectable_label(self.chip.is_none(), "Auto detect (recommended)")
