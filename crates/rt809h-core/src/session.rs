@@ -8,6 +8,7 @@ use crate::ftdi::{self, DeviceEntry};
 use crate::i2c::{Eeprom, EepromGeometry, I2cBus};
 use crate::protocol::{zif_pin_8, ContactReport, Mcu, Voltage};
 use crate::spi::{self, Flash, FlashGeometry, JedecId, SpiBus};
+use crate::vendor_db::Driver;
 use crate::{Error, Result};
 
 /// SCK frequency used for identification.
@@ -342,6 +343,138 @@ impl Programmer {
         let v = res?;
         off?;
         Ok(v)
+    }
+
+    /// Check that a part without an ID (I2C/SPI EEPROM, SPI NAND,
+    /// logic-image families) is reachable; returns a description.
+    pub fn part_check(&mut self, d: &Driver) -> Result<String> {
+        Ok(match *d {
+            Driver::I2c(n) => {
+                self.with_eeprom(n, |_| Ok(()))?;
+                format!("I2C EEPROM answers ({n} bytes)")
+            }
+            Driver::SpiEeprom(n) => {
+                self.with_spi_eeprom(n, |_| Ok(()))?;
+                format!("SPI EEPROM answers ({n} bytes)")
+            }
+            Driver::SpiNand(n) => {
+                self.with_spi_nand(n.voltage, n.geometry, n.id, |_| Ok(()))?;
+                format!(
+                    "SPI NAND answers: {} pages of {} bytes at {}",
+                    n.geometry.pages, n.geometry.page, n.voltage
+                )
+            }
+            Driver::Image(i, s) => {
+                crate::image::find_image(i)?;
+                format!(
+                    "Handled by logic image {i} ({} bytes); this part has no ID",
+                    s.size
+                )
+            }
+            Driver::Spi(_) => return Err(Error::Chip("SPI NOR flash: use detect".into())),
+        })
+    }
+
+    /// Read a part without an ID completely.
+    pub fn part_read(&mut self, d: &Driver, progress: crate::spi::Progress) -> Result<Vec<u8>> {
+        match *d {
+            Driver::I2c(n) => self.with_eeprom(n, |e| e.read(progress)),
+            Driver::SpiEeprom(n) => self.with_spi_eeprom(n, |e| e.read(progress)),
+            Driver::SpiNand(n) => {
+                self.with_spi_nand(n.voltage, n.geometry, n.id, |f| f.read(progress))
+            }
+            Driver::Image(i, s) => self.image_chip_read(i, &s, progress),
+            Driver::Spi(_) => Err(Error::Chip("SPI NOR flash: use with_flash".into())),
+        }
+    }
+
+    /// Write `data` from the start of a part without an ID, erasing first
+    /// where the part needs it. Unused space is filled with `FF` for parts
+    /// that are programmed whole. Notes (bad blocks, ...) go to `note`.
+    pub fn part_write(
+        &mut self,
+        d: &Driver,
+        data: &[u8],
+        progress: crate::spi::Progress,
+        note: &mut dyn FnMut(String),
+    ) -> Result<()> {
+        if data.len() > d.size() as usize {
+            return Err(Error::Chip(format!(
+                "File is {} bytes but the chip holds {}",
+                data.len(),
+                d.size()
+            )));
+        }
+        match *d {
+            Driver::I2c(n) => self.with_eeprom(n, |e| e.write(data, progress)),
+            Driver::SpiEeprom(n) => self.with_spi_eeprom(n, |e| e.write(data, progress)),
+            Driver::SpiNand(n) => {
+                let (bad, failed) = self.with_spi_nand(n.voltage, n.geometry, n.id, |f| {
+                    note("Erasing".into());
+                    let bad = f.erase(&mut |_, _| true)?;
+                    note("Programming".into());
+                    Ok((bad, f.program(data, progress)?))
+                })?;
+                if !bad.is_empty() {
+                    note(format!(
+                        "{} bad blocks: {:?}",
+                        bad.len(),
+                        &bad[..bad.len().min(16)]
+                    ));
+                }
+                if !failed.is_empty() {
+                    return Err(Error::Chip(format!(
+                        "{} pages failed to program (first: page {})",
+                        failed.len(),
+                        failed[0]
+                    )));
+                }
+                Ok(())
+            }
+            Driver::Image(i, _) if !crate::image::writable(i) => Err(Error::Chip(
+                "Programming EPROMs is not supported (the programming voltage of each part is \
+                 not known); reading and verifying work"
+                    .into(),
+            )),
+            Driver::Image(i, s) => {
+                let mut full = data.to_vec();
+                full.resize(s.size as usize, 0xFF);
+                self.image_chip_write(i, &s, &full, progress)
+            }
+            Driver::Spi(_) => Err(Error::Chip("SPI NOR flash: use with_flash".into())),
+        }
+    }
+
+    /// Erase a part without an ID (EEPROMs are filled with `FF`).
+    pub fn part_erase(
+        &mut self,
+        d: &Driver,
+        progress: crate::spi::Progress,
+        note: &mut dyn FnMut(String),
+    ) -> Result<()> {
+        match *d {
+            Driver::I2c(n) => self.with_eeprom(n, |e| e.erase(progress)),
+            Driver::SpiEeprom(n) => {
+                let ff = vec![0xFF; n as usize];
+                self.with_spi_eeprom(n, |e| e.write(&ff, progress))
+            }
+            Driver::SpiNand(n) => {
+                let bad = self.with_spi_nand(n.voltage, n.geometry, n.id, |f| f.erase(progress))?;
+                if !bad.is_empty() {
+                    note(format!(
+                        "{} bad blocks: {:?}",
+                        bad.len(),
+                        &bad[..bad.len().min(16)]
+                    ));
+                }
+                Ok(())
+            }
+            Driver::Image(i, _) if !crate::image::writable(i) => {
+                Err(Error::Chip("EPROMs are erased with UV light".into()))
+            }
+            Driver::Image(i, s) => self.image_chip_erase(i, &s, progress),
+            Driver::Spi(_) => Err(Error::Chip("SPI NOR flash: use with_flash".into())),
+        }
     }
 
     /// Power an SPI NAND flash, check its ID (if one is given) and run `f`.

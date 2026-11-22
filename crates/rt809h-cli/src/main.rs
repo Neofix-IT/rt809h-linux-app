@@ -3,15 +3,15 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
-use rt809h_core::chips;
 use rt809h_core::session::first_difference;
+use rt809h_core::vendor_db::{self, Driver};
 use rt809h_core::{DetectedChip, Error, Programmer, Result, Voltage};
 
 #[derive(Parser)]
 #[command(
     name = "rt809h",
     version,
-    about = "RT809H programmer for 25-series SPI flash"
+    about = "RT809H programmer for SPI flash and I2C EEPROMs"
 )]
 struct Cli {
     /// Chip supply voltage (auto ramps 1.8 -> 2.5 -> 3.3 V and then uses the
@@ -24,6 +24,10 @@ struct Cli {
     /// SPI clock in MHz for data transfers.
     #[arg(long, default_value_t = 10, global = true)]
     mhz: u32,
+    /// Part name (see `rt809h chips`). Required for I2C EEPROMs, which
+    /// cannot be identified automatically.
+    #[arg(long, short = 'c', global = true)]
+    chip: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -77,7 +81,15 @@ enum Cmd {
     /// Check whether the chip is blank (all 0xFF).
     Blank,
     /// List supported chips (optionally filtered).
-    Chips { filter: Option<String> },
+    Chips {
+        filter: Option<String>,
+        /// Also list parts the native driver does not handle yet.
+        #[arg(long)]
+        all: bool,
+        /// Show how many parts of each family are supported.
+        #[arg(long)]
+        stats: bool,
+    },
 }
 
 fn bar(msg: &str) -> ProgressBar {
@@ -101,6 +113,21 @@ fn progress(b: &ProgressBar) -> impl FnMut(u64, u64) -> bool + '_ {
     }
 }
 
+fn target(cli: &Cli) -> Result<Option<Driver>> {
+    let Some(name) = &cli.chip else {
+        return Ok(None);
+    };
+    let c = vendor_db::find(name)
+        .ok_or_else(|| Error::Chip(format!("Unknown part {name}; see `rt809h chips {name}`")))?;
+    c.driver().map(Some).ok_or_else(|| {
+        Error::Chip(format!(
+            "{} ({}) is not supported by the native driver yet",
+            c.name,
+            c.family.label()
+        ))
+    })
+}
+
 fn prepare(cli: &Cli) -> Result<(Programmer, DetectedChip)> {
     let mut p = Programmer::connect_with_log(Box::new(|m| eprintln!("{m}")))?;
     p.spi_hz = cli.mhz.clamp(1, 30) * 1_000_000;
@@ -111,21 +138,134 @@ fn prepare(cli: &Cli) -> Result<(Programmer, DetectedChip)> {
         }
         eprintln!("Contact check OK");
     }
-    let chip = p.detect(cli.voltage.get())?;
+    let chip = match target(cli)? {
+        Some(Driver::Spi(c)) => p.detect_as(&c)?,
+        _ => p.detect(cli.voltage.get())?,
+    };
     Ok((p, chip))
 }
 
-fn run(cli: Cli) -> Result<()> {
+/// Commands for parts without an ID: I2C/SPI EEPROMs, SPI NAND and the
+/// families that run on a logic image.
+fn run_part(cli: &Cli, d: &Driver) -> Result<()> {
+    let mut p = Programmer::connect_with_log(Box::new(|m| eprintln!("{m}")))?;
+    p.spi_hz = cli.mhz.clamp(1, 30) * 1_000_000;
+    let eight_pin = !matches!(d, Driver::Image(..));
+    if eight_pin && !cli.no_contact_check {
+        let v = match d {
+            Driver::SpiNand(n) => n.voltage,
+            _ => Voltage::V3_3,
+        };
+        if let Some(problem) = p.check_contact_8pin(v)? {
+            return Err(Error::Chip(problem));
+        }
+        eprintln!("Contact check OK");
+    }
+    let read = |p: &mut Programmer, msg: &str| -> Result<Vec<u8>> {
+        let b = bar(msg);
+        let r = p.part_read(d, &mut progress(&b))?;
+        b.finish();
+        Ok(r)
+    };
+    let mut note = |m: String| eprintln!("{m}");
     match &cli.cmd {
-        Cmd::Chips { filter } => {
-            for c in chips::search(filter.as_deref().unwrap_or("")) {
+        Cmd::Detect => println!("{}", p.part_check(d)?),
+        Cmd::Read { file } => {
+            let data = read(&mut p, "Reading")?;
+            std::fs::write(file, &data)?;
+            println!("Saved {} bytes to {}", data.len(), file.display());
+        }
+        Cmd::Write {
+            file, no_verify, ..
+        } => {
+            let data = std::fs::read(file)?;
+            let b = bar("Writing");
+            p.part_write(d, &data, &mut progress(&b), &mut note)?;
+            b.finish();
+            if !no_verify {
+                let back = read(&mut p, "Verifying")?;
+                if let Some(off) = first_difference(&data, &back[..data.len()]) {
+                    return Err(Error::Chip(format!("Verify failed at 0x{off:X}")));
+                }
+            }
+            println!("Done");
+        }
+        Cmd::Verify { file } => {
+            let data = std::fs::read(file)?;
+            let back = read(&mut p, "Verifying")?;
+            let n = data.len().min(back.len());
+            match first_difference(&data[..n], &back[..n]) {
+                None => println!("Verify OK"),
+                Some(off) => return Err(Error::Chip(format!("Mismatch at 0x{off:X}"))),
+            }
+        }
+        Cmd::Erase => {
+            let b = bar("Erasing");
+            p.part_erase(d, &mut progress(&b), &mut note)?;
+            b.finish();
+            println!("Erased");
+        }
+        Cmd::Blank => match read(&mut p, "Reading")?.iter().position(|&x| x != 0xFF) {
+            None => println!("Chip is blank"),
+            Some(off) => return Err(Error::Chip(format!("Not blank at 0x{off:X}"))),
+        },
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+fn run(cli: Cli) -> Result<()> {
+    if !matches!(cli.cmd, Cmd::Chips { .. } | Cmd::Info | Cmd::Contact) {
+        match target(&cli)? {
+            Some(Driver::Spi(_)) | None => {}
+            Some(d) => return run_part(&cli, &d),
+        }
+    }
+    match &cli.cmd {
+        Cmd::Chips { filter, all, stats } => {
+            if *stats {
+                let (mut sup, mut tot) = (0, 0);
+                for (f, s, t) in vendor_db::coverage() {
+                    println!(
+                        "{:<20} {:>6} / {:<6} {:>5.1}%",
+                        f.label(),
+                        s,
+                        t,
+                        100.0 * s as f64 / t as f64
+                    );
+                    sup += s;
+                    tot += t;
+                }
                 println!(
-                    "{:<12} {:<22} {:06X} {:>7} KiB  {}",
-                    c.vendor,
+                    "{:<20} {:>6} / {:<6} {:>5.1}%",
+                    "Total",
+                    sup,
+                    tot,
+                    100.0 * sup as f64 / tot as f64
+                );
+                return Ok(());
+            }
+            let q = filter.as_deref().unwrap_or("");
+            for c in vendor_db::search(q)
+                .into_iter()
+                .filter(|c| *all || c.supported())
+            {
+                let size = c.driver().map(|d| d.size()).unwrap_or(c.size);
+                println!(
+                    "{:<20} {:<28} {:<18} {:>9}{}",
+                    c.maker,
                     c.name,
-                    c.id,
-                    c.size / 1024,
-                    c.voltage
+                    c.family.label(),
+                    if size >= 1024 {
+                        format!("{} KiB", size / 1024)
+                    } else {
+                        format!("{size} B")
+                    },
+                    if c.supported() {
+                        ""
+                    } else {
+                        "  (not supported yet)"
+                    }
                 );
             }
         }
