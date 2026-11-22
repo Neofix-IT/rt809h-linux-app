@@ -156,6 +156,26 @@ pub fn microwire_in_circuit() -> Wiring {
     w
 }
 
+/// AVR microcontroller with a UPDI pin, wired like a SerialUPDI adapter on
+/// the contacts an 8-pin SPI flash uses: SO (2) straight to UPDI, SI (5)
+/// through a resistor to UPDI, VSS (4) to GND.
+pub fn avr_updi() -> Wiring {
+    Wiring {
+        target: "AVR board (UPDI)",
+        wires: vec![
+            (EIGHT.pad(2), "UPDI"),
+            (EIGHT.pad(4), "GND"),
+            (EIGHT.pad(5), "UPDI via 1 kΩ"),
+        ],
+        notes: vec![
+            SHORT,
+            "Contacts of an 8-pin flash's pins 2, 5 and 4: pin 2 straight to the UPDI pin, \
+             pin 5 through 1 kΩ to the same pin, pin 4 to GND.",
+            "Power the board from its own 3.3 V supply; VCC is not connected to the programmer.",
+        ],
+    }
+}
+
 /// ENE KB9012 EC on its EDI pins.
 pub fn ene_edi() -> Wiring {
     Wiring {
@@ -281,6 +301,9 @@ pub fn diagrams(chip: Option<&VendorChip>) -> Vec<Diagram> {
         return vec![placement("", true), Diagram::Wires(spi_in_circuit())];
     };
     match c.driver() {
+        Some(Driver::Avr(p, _)) if matches!(p.bus, crate::avr::Bus::Updi(_)) => {
+            vec![Diagram::Wires(avr_updi())]
+        }
         Some(Driver::Avr(..)) => vec![Diagram::Wires(avr_isp())],
         Some(Driver::Ene(_)) => vec![Diagram::Wires(ene_edi())],
         Some(Driver::Spi(_) | Driver::SpiEeprom(_) | Driver::SpiNand(_))
@@ -362,6 +385,8 @@ mod tests {
 
         let avr = diagrams(vendor_db::find("ATmega328P"));
         assert_eq!(avr, vec![Diagram::Wires(avr_isp())]);
+        let updi = diagrams(vendor_db::find("ATtiny212"));
+        assert_eq!(updi, vec![Diagram::Wires(avr_updi())]);
         let nor = diagrams(vendor_db::find("SST39SF040"));
         assert!(!nor.is_empty());
         let w = spi_in_circuit();
