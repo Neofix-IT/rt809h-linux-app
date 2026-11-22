@@ -4,16 +4,30 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
-use rt809h_core::chips::Chip;
 use rt809h_core::session::first_difference;
+use rt809h_core::vendor_db::{Driver, VendorChip};
 use rt809h_core::{DetectedChip, Error, Programmer, Result, Voltage};
 
 #[derive(Clone)]
 pub struct Settings {
     pub voltage: Option<Voltage>,
-    pub chip: Option<Chip>,
+    pub chip: Option<&'static VendorChip>,
     pub contact_check: bool,
     pub spi_mhz: u32,
+}
+
+impl Settings {
+    /// Native driver for the selected part (`None` = auto detect).
+    pub fn driver(&self) -> Option<Driver> {
+        self.chip.and_then(|c| c.driver())
+    }
+
+    fn spi_chip(&self) -> Option<rt809h_core::chips::Chip> {
+        match self.driver() {
+            Some(Driver::Spi(c)) => Some(c),
+            _ => None,
+        }
+    }
 }
 
 pub enum Job {
@@ -45,6 +59,8 @@ pub struct Worker {
     cancel: Arc<AtomicBool>,
     wake: Box<dyn Fn() + Send>,
     prog: Option<Programmer>,
+    /// SPI clock of the job being handled
+    spi_mhz: u32,
 }
 
 impl Worker {
@@ -60,6 +76,7 @@ impl Worker {
             cancel,
             wake,
             prog: None,
+            spi_mhz: 10,
         }
     }
 
@@ -103,7 +120,7 @@ impl Worker {
         p.spi_hz = s.spi_mhz.clamp(1, 30) * 1_000_000;
         if s.contact_check {
             let v = s
-                .chip
+                .spi_chip()
                 .map(|c| c.voltage)
                 .or(s.voltage)
                 .unwrap_or(Voltage::V1_8);
@@ -114,8 +131,8 @@ impl Worker {
             }
             let _ = tx.send(Event::Log("Contact check OK".into()));
         }
-        let chip = match &s.chip {
-            Some(c) => p.detect_as(c)?,
+        let chip = match s.spi_chip() {
+            Some(c) => p.detect_as(&c)?,
             None => p.detect(s.voltage)?,
         };
         self.send(Event::Detected(chip.clone()));
@@ -142,6 +159,22 @@ impl Worker {
     }
 
     fn handle(&mut self, job: Job) -> Result<String> {
+        let settings = match &job {
+            Job::Detect(s)
+            | Job::Read(s)
+            | Job::Write(s, ..)
+            | Job::Verify(s, _)
+            | Job::Erase(s)
+            | Job::Blank(s) => Some(s.clone()),
+            _ => None,
+        };
+        if let Some(s) = &settings {
+            self.spi_mhz = s.spi_mhz;
+        }
+        match settings.as_ref().and_then(|s| s.driver()) {
+            Some(Driver::Spi(_)) | None => {}
+            Some(d) => return self.handle_part(job, d),
+        }
         match job {
             Job::Connect => {
                 self.prog = None;
@@ -151,7 +184,7 @@ impl Worker {
             Job::Contact(s) => {
                 let p = self.programmer()?;
                 let v = s
-                    .chip
+                    .spi_chip()
                     .map(|c| c.voltage)
                     .or(s.voltage)
                     .unwrap_or(Voltage::V1_8);
@@ -253,5 +286,78 @@ impl Worker {
                 }
             }
         }
+    }
+
+    fn prog_spi(&mut self) -> Result<&mut Programmer> {
+        let hz = self.spi_mhz.clamp(1, 30) * 1_000_000;
+        let p = self.programmer()?;
+        p.spi_hz = hz;
+        Ok(p)
+    }
+
+    fn read_part(&mut self, d: &Driver, label: &'static str) -> Result<Vec<u8>> {
+        let mut pr = self.progress_fn(label);
+        self.prog_spi()?.part_read(d, &mut pr)
+    }
+
+    /// Jobs for parts without an ID (EEPROMs, SPI NAND, logic-image families).
+    fn handle_part(&mut self, job: Job, d: Driver) -> Result<String> {
+        let size = d.size() as usize;
+        let tx = self.tx.clone();
+        let mut note = move |m: String| {
+            let _ = tx.send(Event::Log(m));
+        };
+        match job {
+            Job::Detect(_) => self.prog_spi()?.part_check(&d),
+            Job::Read(_) => {
+                let data = self.read_part(&d, "Reading")?;
+                self.send(Event::Data(data));
+                Ok(format!("Read {}", fmt_size(size)))
+            }
+            Job::Write(_, data, verify) => {
+                let mut pw = self.progress_fn("Writing");
+                self.prog_spi()?.part_write(&d, &data, &mut pw, &mut note)?;
+                if verify {
+                    let back = self.read_part(&d, "Verifying")?;
+                    if let Some(off) = first_difference(&data, &back[..data.len()]) {
+                        return Err(Error::Chip(format!("Verify failed at 0x{off:X}")));
+                    }
+                }
+                Ok(if verify {
+                    "Write and verify OK".into()
+                } else {
+                    "Write OK".into()
+                })
+            }
+            Job::Verify(_, data) => {
+                let back = self.read_part(&d, "Verifying")?;
+                let n = data.len().min(back.len());
+                match first_difference(&data[..n], &back[..n]) {
+                    None => Ok("Verify OK".into()),
+                    Some(off) => Err(Error::Chip(format!("Mismatch at 0x{off:X}"))),
+                }
+            }
+            Job::Erase(_) => {
+                let mut pe = self.progress_fn("Erasing");
+                self.prog_spi()?.part_erase(&d, &mut pe, &mut note)?;
+                Ok("Chip erased".into())
+            }
+            Job::Blank(_) => {
+                let data = self.read_part(&d, "Checking")?;
+                match data.iter().position(|&b| b != 0xFF) {
+                    None => Ok("Chip is blank".into()),
+                    Some(off) => Err(Error::Chip(format!("Not blank (first data at 0x{off:X})"))),
+                }
+            }
+            Job::Connect | Job::Contact(_) => unreachable!(),
+        }
+    }
+}
+
+fn fmt_size(n: usize) -> String {
+    if n >= 1024 {
+        format!("{} KiB", n / 1024)
+    } else {
+        format!("{n} bytes")
     }
 }

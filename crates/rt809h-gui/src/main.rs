@@ -12,7 +12,7 @@ use eframe::egui::{
     self, text::LayoutJob, Align, Align2, Color32, FontId, Frame, Key, KeyboardShortcut, Layout,
     Margin, Modifiers, RichText, Sense, Stroke, TextFormat, Ui, Vec2,
 };
-use rt809h_core::chips::{self, Chip};
+use rt809h_core::vendor_db::{self, Driver, VendorChip};
 use rt809h_core::{DetectedChip, Voltage};
 use theme::{bold, tint, Palette};
 use worker::{Event, Job, Settings, Worker};
@@ -104,7 +104,7 @@ struct App {
     detected: Option<DetectedChip>,
     contact: Option<Option<String>>,
     volt: VoltChoice,
-    chip: Option<Chip>,
+    chip: Option<&'static VendorChip>,
     chip_filter: String,
     chip_popup_open: bool,
     contact_check: bool,
@@ -478,8 +478,8 @@ impl App {
     fn settings_card(&mut self, ui: &mut Ui, p: &Palette) {
         card(ui, p, |ui| {
             section(ui, p, "CHIP TYPE");
-            let label = match &self.chip {
-                Some(c) => c.display_name(),
+            let label = match self.chip {
+                Some(c) => part_label(c),
                 None => "Auto detect".into(),
             };
             let width = ui.available_width();
@@ -504,13 +504,13 @@ impl App {
                         search.request_focus();
                         self.chip_popup_open = true;
                     }
-                    let matches = chips::search(&self.chip_filter);
+                    let matches = vendor_db::search_supported(&self.chip_filter);
                     if search.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                         // Enter picks the first match (or auto detect)
                         self.chip = if self.chip_filter.trim().is_empty() {
                             None
                         } else {
-                            matches.first().map(|c| **c).or(self.chip)
+                            matches.first().copied().or(self.chip)
                         };
                         ui.close();
                     }
@@ -535,24 +535,25 @@ impl App {
                                     ui.label(RichText::new("No matching chip").color(p.dim));
                                 });
                             }
-                            for c in matches.iter().take(250) {
-                                let sel = self
-                                    .chip
-                                    .map(|x| x.id == c.id && x.name == c.name)
-                                    .unwrap_or(false);
+                            for &c in matches.iter().take(250) {
+                                let sel = self.chip.is_some_and(|x| std::ptr::eq(x, c));
                                 let mut job = LayoutJob::default();
                                 job.append(
-                                    &c.display_name(),
+                                    &part_label(c),
                                     0.0,
                                     TextFormat::simple(FontId::proportional(14.0), p.text),
                                 );
                                 job.append(
-                                    &format!("   {} · {}", size_str(c.size), c.voltage),
+                                    &format!(
+                                        "   {} · {}",
+                                        size_str(part_size(c)),
+                                        c.family.label()
+                                    ),
                                     0.0,
                                     TextFormat::simple(FontId::proportional(12.0), p.dim),
                                 );
                                 if ui.selectable_label(sel, job).clicked() {
-                                    self.chip = Some(**c);
+                                    self.chip = Some(c);
                                     ui.close();
                                 }
                             }
@@ -563,12 +564,15 @@ impl App {
             }
             ui.add_space(8.0);
             section(ui, p, "SUPPLY VOLTAGE");
-            match self.chip {
-                Some(c) => {
+            match self.chip.and_then(|c| c.driver()) {
+                Some(Driver::Spi(c)) => {
                     ui.label(
                         RichText::new(format!("{} (set by the selected chip)", c.voltage))
                             .color(p.dim),
                     );
+                }
+                Some(_) => {
+                    ui.label(RichText::new("Set by the selected chip").color(p.dim));
                 }
                 None => {
                     segmented(ui, p, &mut self.volt);
@@ -1551,6 +1555,18 @@ fn icon() -> egui::IconData {
         width: n as u32,
         height: n as u32,
     }
+}
+
+fn part_label(c: &VendorChip) -> String {
+    if c.maker.is_empty() {
+        c.name.to_string()
+    } else {
+        format!("{} {}", c.maker, c.name)
+    }
+}
+
+fn part_size(c: &VendorChip) -> u32 {
+    c.driver().map(|d| d.size()).unwrap_or(c.size)
 }
 
 #[cfg(test)]
