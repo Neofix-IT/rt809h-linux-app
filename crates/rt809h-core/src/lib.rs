@@ -1,7 +1,9 @@
 //! Core library for the RT809H universal programmer.
 
 pub mod chips;
+pub mod emu;
 pub mod ftdi;
+pub mod i2c;
 pub mod protocol;
 pub mod session;
 pub mod spi;

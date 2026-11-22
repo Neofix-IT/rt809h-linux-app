@@ -15,6 +15,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
+use rt809h_core::emu;
 use rt809h_core::ftdi::{self, Ftdi};
 use rt809h_core::protocol::frame;
 
@@ -56,12 +57,21 @@ fn main() {
     }
 }
 
+fn load_vchip() -> Option<emu::Mpsse> {
+    let path = std::env::var("RT809H_EMU").ok()?;
+    let spec = std::fs::read_to_string(path).ok()?;
+    emu::from_spec(spec.trim()).map(emu::Mpsse::new)
+}
+
 fn serve(mut s: TcpStream) -> std::io::Result<()> {
     s.set_nodelay(true)?;
     let mut chans: [Option<Ftdi>; 2] = [None, None];
     // (echo as the MCU will send it, echo the host expects)
     let mut echo_fix: Option<([u8; 10], [u8; 10])> = None;
     let t0 = Instant::now();
+    // virtual chip (see emu.rs), configured by the file named in RT809H_EMU
+    let mut vchip: Option<emu::Mpsse> = None;
+    let mut bitmode: u8 = 0;
     loop {
         let mut hdr = [0u8; 6];
         s.read_exact(&mut hdr)?;
@@ -118,6 +128,7 @@ fn serve(mut s: TcpStream) -> std::io::Result<()> {
                             println!("{ts:9.4} [{ch}] PURGE mask={m}");
                         }
                         6 => {
+                            bitmode = p[1];
                             f.set_bitmode_raw(p[0], p[1])?;
                             println!(
                                 "{ts:9.4} [{ch}] SETBITMODE mask=0x{:02x} mode=0x{:02x}",
@@ -129,6 +140,25 @@ fn serve(mut s: TcpStream) -> std::io::Result<()> {
                             println!("{ts:9.4} [{ch}] LATENCY {}", p[0]);
                         }
                         8 => {
+                            if bitmode == 0 && p.len() == 10 && p[0] == 0xAA {
+                                match p[1] {
+                                    0x52 => {
+                                        vchip = load_vchip();
+                                        if let Some(v) = &vchip {
+                                            println!("{ts:9.4} [{ch}] EMU {}", v.describe());
+                                        }
+                                    }
+                                    0x01 => vchip = None,
+                                    _ => {}
+                                }
+                            } else if bitmode == 2 {
+                                if let Some(v) = vchip.as_mut() {
+                                    v.feed(&p);
+                                    for e in v.events() {
+                                        println!("{ts:9.4} [{ch}] EMU {e}");
+                                    }
+                                }
+                            }
                             if let Some(fixed) = fix_spi_mode(&p) {
                                 let mut want: [u8; 10] = p[..].try_into().unwrap();
                                 want[0] = 0x55;
@@ -148,6 +178,14 @@ fn serve(mut s: TcpStream) -> std::io::Result<()> {
                             let to = u32le(&p[4..]);
                             let mut d =
                                 f.read_timeout(n, Duration::from_millis(to.max(1) as u64))?;
+                            if let Some(v) = vchip.as_mut().filter(|_| bitmode == 2) {
+                                for b in d.iter_mut() {
+                                    match v.replies.pop_front() {
+                                        Some(x) => *b = x,
+                                        None => break,
+                                    }
+                                }
+                            }
                             if let Some((got, want)) = echo_fix {
                                 if d.len() >= 10 && d[..10] == got {
                                     d[..10].copy_from_slice(&want);

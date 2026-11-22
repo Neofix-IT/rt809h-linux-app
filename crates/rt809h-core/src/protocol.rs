@@ -50,7 +50,7 @@ pub fn check_byte(f: &[u8; 10]) -> u8 {
 }
 
 /// Supply voltage for the chip, in volts.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Voltage {
     V1_8,
     V2_5,
@@ -189,6 +189,17 @@ impl Mcu {
         Ok(Self { ftdi })
     }
 
+    /// Re-initialise the FTDI channel on the open handle (used after the
+    /// MCU switched logic images).
+    pub fn reinit(&mut self) -> Result<()> {
+        self.ftdi.reset()?;
+        self.ftdi.set_latency(2)?;
+        self.ftdi.set_flow_rts_cts()?;
+        self.ftdi.purge()?;
+        let _ = self.ftdi.read_available(Duration::from_millis(5));
+        Ok(())
+    }
+
     fn sync(&mut self) -> Result<()> {
         self.ftdi.set_bitmode(0xFF, BitMode::Mpsse)?;
         self.ftdi.write(&[0x82, 0x00, 0x40])?;
@@ -272,6 +283,48 @@ impl Mcu {
             .chunks(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect())
+    }
+
+    /// Rails for the bit-banged (I2C) socket mode at 3.3 V, as used by the
+    /// vendor software for 24xx EEPROMs.
+    pub fn set_rails_i2c(&mut self) -> Result<()> {
+        let mut words: [u16; 20] = [0x0211; 20];
+        words[0] = 0x0010;
+        words[1] = 0x00C0;
+        words[2] = 0x00EA;
+        words[15] = 0x0294;
+        words[18] = Voltage::V3_3.rail_code();
+        words[19] = Voltage::V3_3.rail_code();
+        let payload: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        self.command(CMD_SET_RAILS, 0x14, 0x00, PAD)?;
+        self.ftdi.write(&payload)?;
+        self.ftdi.read_exact(40)?;
+        Ok(())
+    }
+
+    /// Hand the socket to the FTDI for bit-banged buses (I2C) and switch
+    /// the FTDI to MPSSE. `mode` is the routing byte (`00` in captures).
+    pub fn enter_bitbang(&mut self, mode: u8) -> Result<()> {
+        self.command(CMD_SET_MODE, 0x00, mode, [1, 0, 0, 0, 0])?;
+        self.ftdi.set_bitmode(0x00, BitMode::Reset)?;
+        self.ftdi.set_bitmode(0x00, BitMode::Mpsse)?;
+        std::thread::sleep(Duration::from_millis(50));
+        Ok(())
+    }
+
+    /// Power off after `enter_bitbang`.
+    pub fn power_off_bitbang(&mut self, mode: u8) -> Result<()> {
+        self.ftdi.set_bitmode(0xFF, BitMode::Reset)?;
+        self.command_noack(CMD_POWER_OFF, 0x00, mode, [1, 0, 0, 0, 0])?;
+        self.ftdi.set_bitmode(0xFF, BitMode::Mpsse)?;
+        self.ftdi.write(&[0x82, 0x00, 0x80])?;
+        std::thread::sleep(Duration::from_millis(10));
+        self.ftdi.write(&[0x82, 0xFF, 0x00])?;
+        self.ftdi.set_bitmode(0xFF, BitMode::Reset)?;
+        std::thread::sleep(Duration::from_millis(100));
+        self.ftdi.purge()?;
+        let _ = self.ftdi.read_available(Duration::from_millis(5));
+        Ok(())
     }
 
     /// Raw supply monitor readings (three 10-bit ADC values).

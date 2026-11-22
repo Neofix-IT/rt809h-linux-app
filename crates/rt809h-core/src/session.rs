@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::chips::{self, Chip};
 use crate::ftdi::{self, DeviceEntry};
+use crate::i2c::{Eeprom, EepromGeometry, I2cBus};
 use crate::protocol::{zif_pin_8, ContactReport, Mcu, Voltage};
 use crate::spi::{self, Flash, FlashGeometry, JedecId, SpiBus};
 use crate::{Error, Result};
@@ -45,6 +46,8 @@ pub struct Programmer {
     pub info: ProgrammerInfo,
     /// SCK frequency for data transfers.
     pub spi_hz: u32,
+    /// routing byte that worked for I2C in this session
+    i2c_mode: Option<u8>,
     log: Box<dyn FnMut(&str) + Send>,
 }
 
@@ -82,6 +85,7 @@ impl Programmer {
                 hw,
             },
             spi_hz: 10_000_000,
+            i2c_mode: None,
             log,
         })
     }
@@ -318,6 +322,59 @@ impl Programmer {
         let v = res?;
         off?;
         Ok(v)
+    }
+}
+
+impl Programmer {
+    /// Power a 24xx I2C EEPROM of `size` bytes and run `f` on it. The socket
+    /// is always switched off afterwards.
+    pub fn with_eeprom<T>(
+        &mut self,
+        size: u32,
+        f: impl FnOnce(&mut Eeprom) -> Result<T>,
+    ) -> Result<T> {
+        // the routing byte seen in captures is 00; try the variants with the
+        // connect bits set if nothing answers
+        let modes: Vec<u8> = match self.i2c_mode {
+            Some(m) => vec![m],
+            None => vec![0x00, 0x80, 0xC0],
+        };
+        let geo = EepromGeometry::for_size(size);
+        let mut f = Some(f);
+        let mut last =
+            Error::Chip("The EEPROM does not answer. Check orientation and contact.".into());
+        for mode in modes {
+            self.mcu.set_rails_i2c()?;
+            self.mcu.enter_bitbang(mode)?;
+            let res = (|| {
+                let bus = I2cBus::init(&mut self.mcu.ftdi)?;
+                let mut e = Eeprom::new(bus, geo);
+                if !e.present()? {
+                    return Ok(None);
+                }
+                let f = f.take().expect("called once");
+                f(&mut e).map(Some)
+            })();
+            let off = self.mcu.power_off_bitbang(mode);
+            match res {
+                Ok(Some(v)) => {
+                    self.i2c_mode = Some(mode);
+                    off?;
+                    return Ok(v);
+                }
+                Ok(None) => {
+                    off?;
+                    log::debug!("no I2C answer with routing byte {mode:02X}");
+                }
+                Err(e) => {
+                    let _ = off;
+                    last = e;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Err(last)
     }
 }
 

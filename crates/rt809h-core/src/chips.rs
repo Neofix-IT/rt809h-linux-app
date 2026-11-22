@@ -17,7 +17,7 @@ pub enum Family {
     Sst26,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Chip {
     pub vendor: &'static str,
     pub name: &'static str,
