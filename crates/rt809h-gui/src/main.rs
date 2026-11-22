@@ -514,7 +514,10 @@ impl App {
                     ui.add_space(4.0);
                     egui::ScrollArea::vertical()
                         .id_salt("chip_list")
+                        // fixed height so the popup does not shrink while filtering
+                        .min_scrolled_height(list_h)
                         .max_height(list_h)
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
                             if ui
                                 .selectable_label(self.chip.is_none(), "Auto detect (recommended)")
@@ -524,7 +527,10 @@ impl App {
                                 ui.close();
                             }
                             if matches.is_empty() {
-                                ui.label(RichText::new("No matching chip").color(p.dim));
+                                ui.horizontal(|ui| {
+                                    ui.add_space(12.0);
+                                    ui.label(RichText::new("No matching chip").color(p.dim));
+                                });
                             }
                             for c in matches.iter().take(250) {
                                 let sel = self
