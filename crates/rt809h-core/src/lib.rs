@@ -4,6 +4,7 @@ pub mod chips;
 pub mod emu;
 pub mod ftdi;
 pub mod i2c;
+pub mod image;
 pub mod protocol;
 pub mod session;
 pub mod spi;

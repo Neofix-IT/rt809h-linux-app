@@ -378,6 +378,120 @@ impl Programmer {
     }
 }
 
+impl Programmer {
+    /// Make sure logic image `name` is running, uploading it if needed.
+    pub fn ensure_image(&mut self, name: &str) -> Result<()> {
+        if self.mcu.algorithm()?.eq_ignore_ascii_case(name) {
+            return Ok(());
+        }
+        let path = crate::image::find_image(name)?;
+        let data = std::fs::read(&path)?;
+        if self.mcu.algorithm()? != "BASE" {
+            self.mcu.reset_algorithm()?;
+            std::thread::sleep(Duration::from_millis(100));
+            self.mcu.reinit()?;
+        }
+        self.say(&format!("Loading programmer logic {name}"));
+        self.mcu.load_image(&data)?;
+        std::thread::sleep(Duration::from_millis(100));
+        self.mcu.reinit()?;
+        let now = self.mcu.algorithm()?;
+        if !now.eq_ignore_ascii_case(name) {
+            return Err(Error::Protocol(format!(
+                "logic image did not start (programmer reports {now})"
+            )));
+        }
+        self.info.algorithm = now;
+        Ok(())
+    }
+
+    /// Run `f` with a chip that is handled by a logic image: the image is
+    /// loaded, the rails set and the chip parameters sent first.
+    pub fn with_image<T>(
+        &mut self,
+        image: &str,
+        setup: &crate::image::Setup,
+        f: impl FnOnce(&mut Mcu) -> Result<T>,
+    ) -> Result<T> {
+        self.ensure_image(image)?;
+        let res = (|| {
+            self.mcu.set_rails_words(&setup.rails())?;
+            let st = self.mcu.set_params(&setup.params(), setup.tail())?;
+            log::debug!("parameter status {st:02X}");
+            f(&mut self.mcu)
+        })();
+        let fin = self.mcu.image_finish().and_then(|_| self.mcu.reinit());
+        let v = res?;
+        fin?;
+        Ok(v)
+    }
+
+    /// Read a part that runs on a logic image.
+    pub fn image_chip_read(
+        &mut self,
+        image: &str,
+        setup: &crate::image::Setup,
+        progress: crate::spi::Progress,
+    ) -> Result<Vec<u8>> {
+        self.with_image(image, setup, |m| {
+            m.image_read(
+                crate::image::CMD_READ,
+                setup.tail(),
+                setup.size as usize,
+                progress,
+            )
+        })
+    }
+
+    /// Program a part that runs on a logic image (whole chip).
+    pub fn image_chip_write(
+        &mut self,
+        image: &str,
+        setup: &crate::image::Setup,
+        data: &[u8],
+        progress: crate::spi::Progress,
+    ) -> Result<()> {
+        if data.len() != setup.size as usize {
+            return Err(Error::Chip(format!(
+                "image is {} bytes, chip holds {}",
+                data.len(),
+                setup.size
+            )));
+        }
+        self.with_image(image, setup, |m| {
+            m.image_program(setup.tail(), data, progress)
+        })
+    }
+
+    /// Erase a part that runs on a logic image and confirm it reads blank.
+    pub fn image_chip_erase(
+        &mut self,
+        image: &str,
+        setup: &crate::image::Setup,
+        progress: crate::spi::Progress,
+    ) -> Result<()> {
+        let st = self.with_image(image, setup, |m| m.image_erase(setup))?;
+        log::debug!("erase status {st:02X}");
+        let back = self.image_chip_read(image, setup, progress)?;
+        match back.iter().position(|&b| b != 0xFF) {
+            None => Ok(()),
+            Some(off) => Err(Error::Chip(format!("erase failed: not blank at 0x{off:X}"))),
+        }
+    }
+
+    /// Read a Microwire (93xx) EEPROM.
+    pub fn microwire_read(&mut self, size: u32, progress: crate::spi::Progress) -> Result<Vec<u8>> {
+        use crate::image::microwire as mw;
+        self.image_chip_read(mw::IMAGE, &mw::setup(size), progress)
+    }
+
+    /// Program a Microwire (93xx) EEPROM (whole chip).
+    pub fn microwire_write(&mut self, data: &[u8], progress: crate::spi::Progress) -> Result<()> {
+        use crate::image::microwire as mw;
+        self.image_chip_write(mw::IMAGE, &mw::setup(data.len() as u32), data, progress)
+    }
+}
+
 /// Compare two buffers, returning the first differing offset.
 pub fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
     a.iter()
