@@ -87,6 +87,37 @@ struct LogLine {
 enum Confirm {
     Write,
     Erase,
+    Fuses,
+}
+
+/// Fuses read from the selected AVR, with the values being edited.
+struct FuseEdit {
+    part: &'static str,
+    values: rt809h_core::avr::FuseValues,
+    text: Vec<String>,
+}
+
+impl FuseEdit {
+    fn new(part: &'static str, values: rt809h_core::avr::FuseValues) -> Self {
+        let text = values
+            .fuses
+            .iter()
+            .map(|f| format!("{:02X}", f.2))
+            .collect();
+        Self { part, values, text }
+    }
+
+    /// Edited bytes that differ from the chip, or `None` if a field is not hex.
+    fn changes(&self) -> Option<Vec<(usize, u8)>> {
+        let mut out = Vec::new();
+        for (f, t) in self.values.fuses.iter().zip(&self.text) {
+            let v = parse_hex(t)?;
+            if v != f.2 {
+                out.push((f.0, v));
+            }
+        }
+        Some(out)
+    }
 }
 
 struct Running {
@@ -103,6 +134,10 @@ struct App {
     busy: Option<&'static str>,
     connected: Option<String>,
     detected: Option<DetectedChip>,
+    /// chip the detection state belongs to; a new selection clears it
+    detected_for: Option<&'static VendorChip>,
+    /// answer of a part without an ID to the last Detect
+    part_found: Option<String>,
     contact: Option<Option<String>>,
     volt: VoltChoice,
     chip: Option<&'static VendorChip>,
@@ -112,7 +147,10 @@ struct App {
     verify_after_write: bool,
     spi_mhz: u32,
     avr_eeprom: bool,
+    fuses: Option<FuseEdit>,
     conn_tab: usize,
+    conn_open: bool,
+    fuses_open: bool,
     conn_window: bool,
     buffer: Option<Buffer>,
     running: Option<Running>,
@@ -145,6 +183,8 @@ impl App {
             busy: None,
             connected: None,
             detected: None,
+            detected_for: None,
+            part_found: None,
             contact: None,
             volt: VoltChoice::Auto,
             chip: None,
@@ -153,7 +193,10 @@ impl App {
             contact_check: true,
             verify_after_write: true,
             avr_eeprom: false,
+            fuses: None,
             conn_tab: 0,
+            conn_open: true,
+            fuses_open: false,
             conn_window: false,
             spi_mhz: 15,
             buffer: None,
@@ -174,6 +217,39 @@ impl App {
             app.load_path(std::path::Path::new(&path));
         }
         app
+    }
+
+    /// Forget what was detected when another chip is selected.
+    fn sync_selection(&mut self) {
+        let same = match (self.detected_for, self.chip) {
+            (None, None) => true,
+            (Some(a), Some(b)) => std::ptr::eq(a, b),
+            _ => false,
+        };
+        if !same {
+            self.detected_for = self.chip;
+            self.detected = None;
+            self.part_found = None;
+            self.contact = None;
+            self.fuses = None;
+        }
+    }
+
+    /// Driver of a selected part that has no ID (anything but SPI NOR flash).
+    fn part_driver(&self) -> Option<Driver> {
+        match self.settings().driver() {
+            Some(Driver::Spi(_)) | None => None,
+            d => d,
+        }
+    }
+
+    /// Name of the chip being worked on: detected, else selected.
+    fn chip_name(&self) -> Option<String> {
+        match (&self.detected, self.chip) {
+            (Some(c), _) => Some(c.name()),
+            (None, Some(c)) => Some(part_label(c)),
+            (None, None) => None,
+        }
     }
 
     fn settings(&self) -> Settings {
@@ -230,10 +306,15 @@ impl App {
                 Event::Connected(l) => self.connected = Some(l),
                 Event::Disconnected => self.connected = None,
                 Event::Detected(c) => self.detected = Some(c),
+                Event::Fuses(f) => {
+                    if let Some(Driver::Avr(part, _)) = self.chip.and_then(|c| c.driver()) {
+                        self.fuses = Some(FuseEdit::new(part.name, f));
+                    }
+                }
                 Event::Contact(c) => self.contact = Some(c),
                 Event::Data(d) => {
-                    let origin = match &self.detected {
-                        Some(c) => format!("Read from {}", c.name()),
+                    let origin = match self.chip_name() {
+                        Some(n) => format!("Read from {n}"),
                         None => "Read from chip".into(),
                     };
                     self.buffer = Some(Buffer::new(d, origin));
@@ -241,6 +322,9 @@ impl App {
                 Event::Finished(r) => {
                     let was = self.busy.take();
                     self.running = None;
+                    if was == Some("Detecting") && self.part_driver().is_some() {
+                        self.part_found = r.as_ref().ok().cloned();
+                    }
                     match r {
                         Ok(m) => {
                             self.push_log(LogKind::Ok, m.clone());
@@ -288,8 +372,8 @@ impl App {
 
     fn save_file(&mut self) {
         let Some(buf) = &self.buffer else { return };
-        let default = match &self.detected {
-            Some(c) => format!("{}.bin", c.name().replace([' ', '/', '(', ')'], "_")),
+        let default = match self.chip_name() {
+            Some(n) => format!("{}.bin", n.replace([' ', '/', '(', ')'], "_")),
             None => "dump.bin".into(),
         };
         let data = buf.data.clone();
@@ -366,7 +450,7 @@ impl App {
                         .color(p.text),
                 );
                 ui.label(
-                    RichText::new("25-series SPI flash")
+                    RichText::new("Flash, EEPROM and AVR programmer")
                         .size(12.0)
                         .color(p.dim),
                 );
@@ -403,20 +487,44 @@ impl App {
             .id_salt("side")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                self.sync_selection();
                 self.chip_card(ui, p);
                 ui.add_space(12.0);
                 self.connection_card(ui, p);
                 ui.add_space(12.0);
                 self.settings_card(ui, p);
-                ui.add_space(12.0);
-                self.options_card(ui, p);
+                if let Some(Driver::Avr(part, _)) = self.chip.and_then(|c| c.driver()) {
+                    ui.add_space(12.0);
+                    self.fuses_card(ui, p, part);
+                }
             });
     }
 
     fn chip_card(&mut self, ui: &mut Ui, p: &Palette) {
         card(ui, p, |ui| {
             section(ui, p, "CHIP");
+            self.chip_selector(ui, p);
+            ui.add_space(8.0);
+            let part = self.part_driver().zip(self.chip);
+            let is_part = part.is_some();
             match &self.detected {
+                _ if is_part => {
+                    let (d, c) = part.unwrap();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        tag(ui, p, c.family.label());
+                        tag(ui, p, &size_str(d.size()));
+                    });
+                    let (text, color) = match &self.part_found {
+                        Some(m) => (m.clone(), p.text),
+                        None => (
+                            "This part has no ID to detect automatically. Detect checks that it answers."
+                                .to_string(),
+                            p.dim,
+                        ),
+                    };
+                    ui.add(egui::Label::new(RichText::new(text).size(12.5).color(color)).wrap());
+                }
                 Some(c) => {
                     ui.label(
                         RichText::new(c.name())
@@ -435,37 +543,40 @@ impl App {
                     ui.label(
                         RichText::new("No chip detected")
                             .family(bold())
-                            .size(20.0)
+                            .size(17.0)
                             .color(p.faint),
                     );
                     ui.label(
                         RichText::new(
-                            "Put the chip at the bottom of the socket, notch down with pin 1 at the bottom right, close the lever and press Detect.",
+                            "Insert the chip as shown under Connection and press Detect.",
                         )
                         .size(12.5)
                         .color(p.dim),
                     );
                 }
             }
-            ui.add_space(4.0);
-            let (dot, text, color) = match &self.contact {
-                None => (p.faint, "Pin contact not checked yet".to_string(), p.dim),
-                Some(None) => (p.ok, "All 8 pins have good contact".to_string(), p.text),
-                Some(Some(problem)) => (p.err, problem.clone(), p.err),
-            };
-            ui.horizontal_top(|ui| {
-                let (r, _) = ui.allocate_exact_size(Vec2::new(10.0, 18.0), Sense::hover());
-                ui.painter().circle_filled(r.center(), 4.0, dot);
-                ui.add(egui::Label::new(RichText::new(text).size(12.5).color(color)).wrap());
-            });
+            if !is_part {
+                ui.add_space(4.0);
+                let (dot, text, color) = match &self.contact {
+                    None => (p.faint, "Pin contact not checked yet".to_string(), p.dim),
+                    Some(None) => (p.ok, "All 8 pins have good contact".to_string(), p.text),
+                    Some(Some(problem)) => (p.err, problem.clone(), p.err),
+                };
+                ui.horizontal_top(|ui| {
+                    let (r, _) = ui.allocate_exact_size(Vec2::new(10.0, 18.0), Sense::hover());
+                    ui.painter().circle_filled(r.center(), 4.0, dot);
+                    ui.add(egui::Label::new(RichText::new(text).size(12.5).color(color)).wrap());
+                });
+            }
             ui.add_space(6.0);
             let idle = self.busy.is_none();
             ui.horizontal(|ui| {
                 let w = ui.available_width();
+                let detect_w = if is_part { w } else { w * 0.6 };
                 if ui
                     .add_enabled(
                         idle,
-                        primary_button(p, "Detect chip").min_size(Vec2::new(w * 0.6, 34.0)),
+                        primary_button(p, "Detect chip").min_size(Vec2::new(detect_w, 34.0)),
                     )
                     .on_hover_text("Check the pins and identify the chip (F5)")
                     .clicked()
@@ -473,14 +584,15 @@ impl App {
                     let s = self.settings();
                     self.start("Detecting", Job::Detect(s));
                 }
-                if ui
-                    .add_enabled(
-                        idle,
-                        egui::Button::new("Pin test")
-                            .min_size(Vec2::new(ui.available_width(), 34.0)),
-                    )
-                    .on_hover_text("Only check that every chip pin touches the socket")
-                    .clicked()
+                if !is_part
+                    && ui
+                        .add_enabled(
+                            idle,
+                            egui::Button::new("Pin test")
+                                .min_size(Vec2::new(ui.available_width(), 34.0)),
+                        )
+                        .on_hover_text("Only check that every chip pin touches the socket")
+                        .clicked()
                 {
                     let s = self.settings();
                     self.start("Checking contact", Job::Contact(s));
@@ -493,13 +605,18 @@ impl App {
         let diagrams = rt809h_core::connection::diagrams(self.chip);
         card(ui, p, |ui| {
             ui.horizontal(|ui| {
-                section(ui, p, "CONNECTION");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.small_button("Enlarge").clicked() {
-                        self.conn_window = true;
-                    }
-                });
+                fold_section(ui, p, "CONNECTION", &mut self.conn_open);
+                if self.conn_open {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("Enlarge").clicked() {
+                            self.conn_window = true;
+                        }
+                    });
+                }
             });
+            if !self.conn_open {
+                return;
+            }
             let tab = self.conn_tab.min(diagrams.len() - 1);
             if diagrams.len() > 1 {
                 ui.horizontal(|ui| {
@@ -532,122 +649,103 @@ impl App {
         }
     }
 
-    fn settings_card(&mut self, ui: &mut Ui, p: &Palette) {
-        card(ui, p, |ui| {
-            section(ui, p, "CHIP TYPE");
-            let label = match self.chip {
-                Some(c) => part_label(c),
-                None => "Auto detect".into(),
-            };
-            let width = ui.available_width();
-            // keep the popup below the box: size it to the room that is left
-            let below = ui.ctx().content_rect().bottom() - ui.cursor().top() - 60.0;
-            let list_h = (below - 56.0).clamp(140.0, 380.0);
-            let popup = egui::ComboBox::from_id_salt("chip_sel")
-                .width(width)
-                .height(list_h + 56.0)
-                .selected_text(label)
-                // clicks inside (e.g. into the search field) must not close it
-                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                .show_ui(ui, |ui| {
-                    ui.set_min_width(width);
-                    let search = ui.add(
-                        egui::TextEdit::singleline(&mut self.chip_filter)
-                            .hint_text("Type to search, e.g. W25Q128 or MX25L")
-                            .desired_width(f32::INFINITY),
-                    );
-                    if !self.chip_popup_open {
-                        // popup just opened: start typing right away
-                        search.request_focus();
-                        self.chip_popup_open = true;
-                    }
-                    let matches = vendor_db::search_supported(&self.chip_filter);
-                    if search.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                        // Enter picks the first match (or auto detect)
-                        self.chip = if self.chip_filter.trim().is_empty() {
-                            None
-                        } else {
-                            matches.first().copied().or(self.chip)
-                        };
-                        ui.close();
-                    }
-                    ui.add_space(4.0);
-                    egui::ScrollArea::vertical()
-                        .id_salt("chip_list")
-                        // fixed height so the popup does not shrink while filtering
-                        .min_scrolled_height(list_h)
-                        .max_height(list_h)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            if ui
-                                .selectable_label(self.chip.is_none(), "Auto detect (recommended)")
-                                .clicked()
-                            {
-                                self.chip = None;
+    /// Search box for the chip type ("Auto detect" or a part).
+    fn chip_selector(&mut self, ui: &mut Ui, p: &Palette) {
+        let label = match self.chip {
+            Some(c) => part_label(c),
+            None => "Auto detect".into(),
+        };
+        let width = ui.available_width();
+        // keep the popup below the box: size it to the room that is left
+        let below = ui.ctx().content_rect().bottom() - ui.cursor().top() - 60.0;
+        let list_h = (below - 56.0).clamp(140.0, 380.0);
+        let popup = egui::ComboBox::from_id_salt("chip_sel")
+            .width(width)
+            .height(list_h + 56.0)
+            .selected_text(label)
+            // clicks inside (e.g. into the search field) must not close it
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show_ui(ui, |ui| {
+                ui.set_min_width(width);
+                let search = ui.add(
+                    egui::TextEdit::singleline(&mut self.chip_filter)
+                        .hint_text("Type to search, e.g. W25Q128 or MX25L")
+                        .desired_width(f32::INFINITY),
+                );
+                if !self.chip_popup_open {
+                    // popup just opened: start typing right away
+                    search.request_focus();
+                    self.chip_popup_open = true;
+                }
+                let matches = vendor_db::search_supported(&self.chip_filter);
+                if search.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    // Enter picks the first match (or auto detect)
+                    self.chip = if self.chip_filter.trim().is_empty() {
+                        None
+                    } else {
+                        matches.first().copied().or(self.chip)
+                    };
+                    ui.close();
+                }
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("chip_list")
+                    // fixed height so the popup does not shrink while filtering
+                    .min_scrolled_height(list_h)
+                    .max_height(list_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if ui
+                            .selectable_label(self.chip.is_none(), "Auto detect (recommended)")
+                            .clicked()
+                        {
+                            self.chip = None;
+                            ui.close();
+                        }
+                        if matches.is_empty() {
+                            ui.horizontal(|ui| {
+                                ui.add_space(12.0);
+                                ui.label(RichText::new("No matching chip").color(p.dim));
+                            });
+                        }
+                        for &c in matches.iter().take(250) {
+                            let sel = self.chip.is_some_and(|x| std::ptr::eq(x, c));
+                            let mut job = LayoutJob::default();
+                            job.append(
+                                &part_label(c),
+                                0.0,
+                                TextFormat::simple(FontId::proportional(14.0), p.text),
+                            );
+                            job.append(
+                                &format!("   {} · {}", size_str(part_size(c)), c.family.label()),
+                                0.0,
+                                TextFormat::simple(FontId::proportional(12.0), p.dim),
+                            );
+                            if ui.selectable_label(sel, job).clicked() {
+                                self.chip = Some(c);
                                 ui.close();
                             }
-                            if matches.is_empty() {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(12.0);
-                                    ui.label(RichText::new("No matching chip").color(p.dim));
-                                });
-                            }
-                            for &c in matches.iter().take(250) {
-                                let sel = self.chip.is_some_and(|x| std::ptr::eq(x, c));
-                                let mut job = LayoutJob::default();
-                                job.append(
-                                    &part_label(c),
-                                    0.0,
-                                    TextFormat::simple(FontId::proportional(14.0), p.text),
-                                );
-                                job.append(
-                                    &format!(
-                                        "   {} · {}",
-                                        size_str(part_size(c)),
-                                        c.family.label()
-                                    ),
-                                    0.0,
-                                    TextFormat::simple(FontId::proportional(12.0), p.dim),
-                                );
-                                if ui.selectable_label(sel, job).clicked() {
-                                    self.chip = Some(c);
-                                    ui.close();
-                                }
-                            }
-                        });
-                });
-            if popup.inner.is_none() {
-                self.chip_popup_open = false;
-            }
-            ui.add_space(8.0);
-            section(ui, p, "SUPPLY VOLTAGE");
-            match self.chip.and_then(|c| c.driver()) {
-                Some(Driver::Spi(c)) => {
-                    ui.label(
-                        RichText::new(format!("{} (set by the selected chip)", c.voltage))
-                            .color(p.dim),
-                    );
-                }
-                Some(Driver::Avr(..)) => {
-                    ui.label(
-                        RichText::new("Powered by the target board (ISP header, 3.3 V logic)")
-                            .color(p.dim),
-                    );
-                    ui.add_space(8.0);
-                    section(ui, p, "MEMORY");
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.avr_eeprom, false, "Flash");
-                        ui.selectable_value(&mut self.avr_eeprom, true, "EEPROM");
+                        }
                     });
-                }
-                Some(_) => {
-                    ui.label(RichText::new("Set by the selected chip").color(p.dim));
-                }
+            });
+        if popup.inner.is_none() {
+            self.chip_popup_open = false;
+        }
+    }
+
+    fn settings_card(&mut self, ui: &mut Ui, p: &Palette) {
+        let driver = self.chip.and_then(|c| c.driver());
+        let spi = matches!(driver, Some(Driver::Spi(_)) | None);
+        card(ui, p, |ui| {
+            section(ui, p, "SETTINGS");
+            ui.add_space(2.0);
+            match driver {
                 None => {
+                    ui.label("Supply voltage");
                     segmented(ui, p, &mut self.volt);
                     let hint = match self.volt {
                         VoltChoice::Auto => {
-                            "Starts at 1.8 V and steps up to 3.3 V, so low-voltage chips are never overdriven."
+                            "Steps up from 1.8 V, so low-voltage chips are never overdriven."
                         }
                         VoltChoice::Fixed(Voltage::V3_3) => {
                             "Only use 3.3 V if you are sure the chip is rated for it."
@@ -656,27 +754,136 @@ impl App {
                     };
                     ui.label(RichText::new(hint).size(12.0).color(p.dim));
                 }
+                Some(Driver::Spi(c)) => {
+                    value_row(ui, p, "Supply voltage", c.voltage.label());
+                }
+                Some(Driver::Avr(..)) => {
+                    ui.horizontal(|ui| {
+                        ui.label("Memory");
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.selectable_value(&mut self.avr_eeprom, true, "EEPROM");
+                            ui.selectable_value(&mut self.avr_eeprom, false, "Flash");
+                        });
+                    });
+                    value_row(ui, p, "Supply", "from the target board");
+                }
+                Some(_) => value_row(ui, p, "Supply voltage", "set by the chip"),
+            }
+            ui.add_space(4.0);
+            ui.checkbox(&mut self.verify_after_write, "Verify after writing");
+            if spi {
+                ui.checkbox(&mut self.contact_check, "Check pin contact first");
+                ui.horizontal(|ui| {
+                    ui.label("SPI clock");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut self.spi_mhz, 1..=30)
+                                .suffix(" MHz")
+                                .show_value(true),
+                        )
+                        .on_hover_text("Lower it if reads are unstable (long wires, adapters)");
+                    });
+                });
             }
         });
     }
 
-    fn options_card(&mut self, ui: &mut Ui, p: &Palette) {
+    fn fuses_card(&mut self, ui: &mut Ui, p: &Palette, part: &'static rt809h_core::avr::AvrPart) {
+        if self.fuses.as_ref().is_some_and(|f| f.part != part.name) {
+            self.fuses = None;
+        }
+        let idle = self.busy.is_none();
         card(ui, p, |ui| {
-            section(ui, p, "OPTIONS");
-            ui.checkbox(&mut self.contact_check, "Check pin contact first");
-            ui.checkbox(&mut self.verify_after_write, "Verify after writing");
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.label("SPI clock");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add(
-                        egui::Slider::new(&mut self.spi_mhz, 1..=30)
-                            .suffix(" MHz")
-                            .show_value(true),
-                    )
-                    .on_hover_text("Lower it if reads are unstable (long wires, adapters)");
+            ui.horizontal(|ui| fold_section(ui, p, "FUSES", &mut self.fuses_open));
+            if !self.fuses_open {
+                return;
+            }
+            let Some(edit) = &mut self.fuses else {
+                ui.label(
+                    RichText::new("Read the fuses to see and change them.")
+                        .size(12.0)
+                        .color(p.dim),
+                );
+                ui.add_space(6.0);
+                if ui
+                    .add_enabled(idle, egui::Button::new("Read fuses"))
+                    .clicked()
+                {
+                    let s = self.settings();
+                    self.start("Reading fuses", Job::ReadFuses(s));
+                }
+                return;
+            };
+            egui::Grid::new("fuse_grid")
+                .num_columns(2)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    for (f, t) in edit.values.fuses.iter().zip(edit.text.iter_mut()) {
+                        ui.label(RichText::new(f.1).family(egui::FontFamily::Monospace));
+                        let parsed = parse_hex(t);
+                        let ok = parsed.is_some();
+                        let changed = parsed.is_some_and(|v| v != f.2);
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(t)
+                                    .char_limit(4)
+                                    .desired_width(64.0)
+                                    .font(egui::TextStyle::Monospace)
+                                    .text_color(if !ok {
+                                        p.err
+                                    } else if changed {
+                                        p.accent
+                                    } else {
+                                        p.text
+                                    }),
+                            );
+                            if changed {
+                                ui.label(
+                                    RichText::new(format!("was {:02X}", f.2))
+                                        .size(12.0)
+                                        .color(p.dim),
+                                );
+                            }
+                        });
+                        ui.end_row();
+                    }
+                    ui.label(RichText::new("LOCK").family(egui::FontFamily::Monospace));
+                    ui.label(RichText::new(&edit.values.lock).color(p.dim));
+                    ui.end_row();
                 });
+            ui.add_space(6.0);
+            let changes = edit.changes();
+            let mut read = false;
+            let mut write = false;
+            ui.horizontal(|ui| {
+                read = ui
+                    .add_enabled(idle, egui::Button::new("Read again"))
+                    .clicked();
+                let can = idle && changes.as_ref().is_some_and(|c| !c.is_empty());
+                write = ui
+                    .add_enabled(can, primary_button(p, "Write fuses"))
+                    .on_disabled_hover_text("Change a value first (hex, e.g. 0x02)")
+                    .clicked();
             });
+            ui.label(
+                RichText::new(match part.bus {
+                    rt809h_core::avr::Bus::Isp => {
+                        "Wrong clock, RSTDISBL or SPIEN settings lock the part out of ISP. Check the datasheet."
+                    }
+                    rt809h_core::avr::Bus::Updi(_) => {
+                        "Values that turn the UPDI pin into a GPIO are refused. Check the datasheet."
+                    }
+                })
+                .size(12.0)
+                .color(p.dim),
+            );
+            if read {
+                let s = self.settings();
+                self.start("Reading fuses", Job::ReadFuses(s));
+            }
+            if write {
+                self.confirm = Some(Confirm::Fuses);
+            }
         });
     }
 
@@ -947,15 +1154,19 @@ impl App {
                 }
             });
         });
-        if let Some(c) = &self.detected {
-            let chip = c.geometry.size as usize;
+        let size = match &self.detected {
+            Some(c) => Some(c.geometry.size),
+            None => self.part_driver().map(|d| d.size()),
+        };
+        if let Some(size) = size {
+            let chip = size as usize;
             if len > chip {
                 warn_line(
                     ui,
                     p.err,
                     &format!(
                         "The buffer is larger than the chip ({}). It cannot be written.",
-                        size_str(c.geometry.size)
+                        size_str(size)
                     ),
                 );
             } else if len < chip {
@@ -964,7 +1175,7 @@ impl App {
                     p.warn,
                     &format!(
                         "The buffer is smaller than the chip ({}). Writing only changes the first {}.",
-                        size_str(c.geometry.size),
+                        size_str(size),
                         bytes_str(len)
                     ),
                 );
@@ -1099,11 +1310,7 @@ impl App {
 
     fn confirm_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
         let Some(kind) = self.confirm else { return };
-        let chip = self
-            .detected
-            .as_ref()
-            .map(|c| c.name())
-            .unwrap_or_else(|| "the chip".into());
+        let chip = self.chip_name().unwrap_or_else(|| "the chip".into());
         let (title, body, action) = match kind {
             Confirm::Erase => (
                 "Erase the whole chip?",
@@ -1125,6 +1332,27 @@ impl App {
                         }
                     ),
                     "Write chip",
+                )
+            }
+            Confirm::Fuses => {
+                let f = self.fuses.as_ref().unwrap();
+                let list: Vec<String> = f
+                    .changes()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|&(i, v)| {
+                        let (_, n, old) = f.values.fuses.iter().find(|x| x.0 == i)?;
+                        Some(format!("{n} {old:02X} → {v:02X}"))
+                    })
+                    .collect();
+                (
+                    "Program the fuses?",
+                    format!(
+                        "{} on {}. Wrong fuse values can make the part unreachable.",
+                        list.join(", "),
+                        f.part
+                    ),
+                    "Write fuses",
                 )
             }
         };
@@ -1171,6 +1399,14 @@ impl App {
             let s = self.settings();
             match kind {
                 Confirm::Erase => self.start("Erasing", Job::Erase(s)),
+                Confirm::Fuses => {
+                    let c = self
+                        .fuses
+                        .as_ref()
+                        .and_then(|f| f.changes())
+                        .unwrap_or_default();
+                    self.start("Writing fuses", Job::WriteFuses(s, c));
+                }
                 Confirm::Write => {
                     let d = self.buffer.as_ref().unwrap().data.clone();
                     let v = self.verify_after_write;
@@ -1289,6 +1525,54 @@ fn section(ui: &mut Ui, p: &Palette, title: &str) {
             .color(p.dim)
             .extra_letter_spacing(0.8),
     );
+}
+
+/// Card title with a triangle; clicking it folds the card.
+fn fold_section(ui: &mut Ui, p: &Palette, title: &str, open: &mut bool) {
+    let l = ui.add(
+        egui::Label::new(
+            RichText::new(title)
+                .family(bold())
+                .size(11.0)
+                .color(p.dim)
+                .extra_letter_spacing(0.8),
+        )
+        .selectable(false)
+        .sense(Sense::click()),
+    );
+    let (rect, a) = ui.allocate_exact_size(Vec2::new(10.0, l.rect.height()), Sense::click());
+    let c = rect.center();
+    let pts = if *open {
+        vec![
+            c + Vec2::new(-4.0, -2.0),
+            c + Vec2::new(4.0, -2.0),
+            c + Vec2::new(0.0, 3.0),
+        ]
+    } else {
+        vec![
+            c + Vec2::new(-2.0, -4.0),
+            c + Vec2::new(-2.0, 4.0),
+            c + Vec2::new(3.0, 0.0),
+        ]
+    };
+    ui.painter()
+        .add(egui::Shape::convex_polygon(pts, p.dim, Stroke::NONE));
+    if l.union(a)
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+    {
+        *open = !*open;
+    }
+}
+
+/// "Label ........ value" line.
+fn value_row(ui: &mut Ui, p: &Palette, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(RichText::new(value).color(p.dim));
+        });
+    });
 }
 
 fn tag(ui: &mut Ui, p: &Palette, text: &str) {
@@ -1530,6 +1814,13 @@ fn logo(ui: &mut Ui, p: &Palette) {
 }
 
 // ------------------------------------------------------------------ helpers
+
+/// A fuse byte typed as `02`, `0x02` or `0X02`.
+fn parse_hex(t: &str) -> Option<u8> {
+    let t = t.trim();
+    let t = t.strip_prefix("0x").or(t.strip_prefix("0X")).unwrap_or(t);
+    u8::from_str_radix(t, 16).ok()
+}
 
 fn name_of(p: &std::path::Path) -> String {
     p.file_name()

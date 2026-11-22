@@ -44,6 +44,10 @@ pub enum Job {
     Verify(Settings, Arc<Vec<u8>>),
     Erase(Settings),
     Blank(Settings),
+    /// read the fuse bytes of the selected AVR
+    ReadFuses(Settings),
+    /// program fuse bytes (index, value) of the selected AVR
+    WriteFuses(Settings, Vec<(usize, u8)>),
 }
 
 pub enum Event {
@@ -55,6 +59,7 @@ pub enum Event {
     /// Result of a contact check: `None` = all pins OK.
     Contact(Option<String>),
     Data(Vec<u8>),
+    Fuses(rt809h_core::avr::FuseValues),
     Finished(std::result::Result<String, String>),
 }
 
@@ -164,6 +169,22 @@ impl Worker {
     }
 
     fn handle(&mut self, job: Job) -> Result<String> {
+        if let Job::ReadFuses(s) | Job::WriteFuses(s, _) = &job {
+            let Some(Driver::Avr(part, _)) = s.driver() else {
+                return Err(Error::Chip(
+                    "Fuses exist on AVR microcontrollers only".into(),
+                ));
+            };
+            let f = match &job {
+                Job::WriteFuses(_, v) => self.programmer()?.avr_write_fuses(part, v)?,
+                _ => self.programmer()?.avr_read_fuses(part)?,
+            };
+            self.send(Event::Fuses(f));
+            return Ok(match job {
+                Job::WriteFuses(..) => format!("Fuses of {} programmed and read back", part.name),
+                _ => format!("Read the fuses of {}", part.name),
+            });
+        }
         let settings = match &job {
             Job::Detect(s)
             | Job::Read(s)
@@ -290,6 +311,7 @@ impl Worker {
                     Some(off) => Err(Error::Chip(format!("Not blank (first data at 0x{off:X})"))),
                 }
             }
+            Job::ReadFuses(_) | Job::WriteFuses(..) => unreachable!(),
         }
     }
 
@@ -354,7 +376,9 @@ impl Worker {
                     Some(off) => Err(Error::Chip(format!("Not blank (first data at 0x{off:X})"))),
                 }
             }
-            Job::Connect | Job::Contact(_) => unreachable!(),
+            Job::Connect | Job::Contact(_) | Job::ReadFuses(_) | Job::WriteFuses(..) => {
+                unreachable!()
+            }
         }
     }
 }
