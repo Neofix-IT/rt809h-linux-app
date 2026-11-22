@@ -27,6 +27,8 @@ const PURGE_TX: u16 = 2;
 
 const CTRL_TIMEOUT: Duration = Duration::from_millis(1000);
 const READ_CHUNK: usize = 64 * 1024;
+/// Writes longer than this keep reading replies while they are sent.
+const DRAIN_ABOVE: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -234,7 +236,35 @@ impl Ftdi {
         for chunk in data.chunks(READ_CHUNK) {
             let mut buf = Buffer::new(chunk.len());
             buf.extend_from_slice(chunk);
-            let c = self.ep_out.transfer_blocking(buf, Duration::from_secs(5));
+            if data.len() <= DRAIN_ABOVE {
+                let c = self.ep_out.transfer_blocking(buf, Duration::from_secs(5));
+                c.status.map_err(|e| Error::Usb(format!("write: {e}")))?;
+                if c.actual_len != chunk.len() {
+                    return Err(Error::Usb(format!(
+                        "short write {}/{}",
+                        c.actual_len,
+                        chunk.len()
+                    )));
+                }
+                continue;
+            }
+            self.ep_out.submit(buf);
+            // Long MPSSE batches produce replies while they are being sent;
+            // keep reading them, or the chip's FIFO fills and the write stalls.
+            let start = Instant::now();
+            let c = loop {
+                if let Some(c) = self.ep_out.wait_next_complete(Duration::from_millis(5)) {
+                    break c;
+                }
+                if start.elapsed() > Duration::from_secs(5) {
+                    self.ep_out.cancel_all();
+                    break self
+                        .ep_out
+                        .wait_next_complete(Duration::from_secs(1))
+                        .ok_or_else(|| Error::Usb("write: no completion".into()))?;
+                }
+                self.fill(READ_CHUNK)?;
+            };
             c.status.map_err(|e| Error::Usb(format!("write: {e}")))?;
             if c.actual_len != chunk.len() {
                 return Err(Error::Usb(format!(
@@ -258,7 +288,8 @@ impl Ftdi {
             .transfer_blocking(Buffer::new(len), Duration::from_millis(500));
         match c.status {
             Ok(()) => {}
-            Err(nusb::transfer::TransferError::Cancelled) => return Ok(()),
+            // a timed-out read still carries what arrived before the cancel
+            Err(nusb::transfer::TransferError::Cancelled) => {}
             Err(e) => return Err(Error::Usb(format!("read: {e}"))),
         }
         let data = &c.buffer[..c.actual_len];
