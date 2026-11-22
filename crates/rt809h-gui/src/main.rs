@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod diagram;
 mod theme;
 mod worker;
 
@@ -111,6 +112,8 @@ struct App {
     verify_after_write: bool,
     spi_mhz: u32,
     avr_eeprom: bool,
+    conn_tab: usize,
+    conn_window: bool,
     buffer: Option<Buffer>,
     running: Option<Running>,
     status: Option<(bool, String)>,
@@ -150,6 +153,8 @@ impl App {
             contact_check: true,
             verify_after_write: true,
             avr_eeprom: false,
+            conn_tab: 0,
+            conn_window: false,
             spi_mhz: 15,
             buffer: None,
             running: None,
@@ -161,6 +166,10 @@ impl App {
             scroll_to_row: None,
         };
         app.start("Connecting", Job::Connect);
+        // preselect a part, e.g. RT809H_CHIP=ATmega328P
+        if let Ok(name) = std::env::var("RT809H_CHIP") {
+            app.chip = vendor_db::find(&name);
+        }
         if let Some(path) = std::env::args_os().nth(1) {
             app.load_path(std::path::Path::new(&path));
         }
@@ -396,6 +405,8 @@ impl App {
             .show(ui, |ui| {
                 self.chip_card(ui, p);
                 ui.add_space(12.0);
+                self.connection_card(ui, p);
+                ui.add_space(12.0);
                 self.settings_card(ui, p);
                 ui.add_space(12.0);
                 self.options_card(ui, p);
@@ -429,7 +440,7 @@ impl App {
                     );
                     ui.label(
                         RichText::new(
-                            "Put the chip at the bottom of the socket with pin 1 facing up, close the lever and press Detect.",
+                            "Put the chip at the bottom of the socket, notch down with pin 1 at the bottom right, close the lever and press Detect.",
                         )
                         .size(12.5)
                         .color(p.dim),
@@ -476,6 +487,49 @@ impl App {
                 }
             });
         });
+    }
+
+    fn connection_card(&mut self, ui: &mut Ui, p: &Palette) {
+        let diagrams = rt809h_core::connection::diagrams(self.chip);
+        card(ui, p, |ui| {
+            ui.horizontal(|ui| {
+                section(ui, p, "CONNECTION");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("Enlarge").clicked() {
+                        self.conn_window = true;
+                    }
+                });
+            });
+            let tab = self.conn_tab.min(diagrams.len() - 1);
+            if diagrams.len() > 1 {
+                ui.horizontal(|ui| {
+                    for (i, d) in diagrams.iter().enumerate() {
+                        if ui.selectable_label(tab == i, d.title()).clicked() {
+                            self.conn_tab = i;
+                        }
+                    }
+                });
+            }
+            ui.add_space(4.0);
+            diagram::draw(ui, p, &diagrams[tab]);
+        });
+        if self.conn_window {
+            let mut open = true;
+            egui::Window::new("Connection")
+                .open(&mut open)
+                .default_width(560.0)
+                .resizable(true)
+                .show(ui.ctx(), |ui| {
+                    let tab = self.conn_tab.min(diagrams.len() - 1);
+                    ui.label(
+                        RichText::new(diagrams[tab].title())
+                            .family(bold())
+                            .color(p.text),
+                    );
+                    diagram::draw(ui, p, &diagrams[tab]);
+                });
+            self.conn_window = open;
+        }
     }
 
     fn settings_card(&mut self, ui: &mut Ui, p: &Palette) {

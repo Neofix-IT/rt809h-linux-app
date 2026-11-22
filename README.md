@@ -89,8 +89,10 @@ sudo cp 60-rt809h.rules /etc/udev/rules.d/ && sudo udevadm control --reload && s
 
 ## Using it
 
-Put the chip at the **bottom** of the ZIF socket with **pin 1 (dot) pointing
-to the top of the socket** (chip pin 1 = socket pin 21). Then press **Detect**, **Read** or
+Put the chip at the **bottom** of the ZIF socket (lever at the top left),
+**notch down with pin 1 (dot) on the bottom-right contact**. The app's
+Connection panel draws where the selected part goes, which adapter it needs
+and how to wire it in circuit. Then press **Detect**, **Read** or
 **Write** in the app, or use the CLI:
 
 ```bash

@@ -2,6 +2,7 @@
 
 pub mod avr;
 pub mod chips;
+pub mod connection;
 pub mod emu;
 pub mod ftdi;
 pub mod i2c;
