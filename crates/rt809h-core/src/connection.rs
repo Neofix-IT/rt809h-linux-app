@@ -156,6 +156,25 @@ pub fn microwire_in_circuit() -> Wiring {
     w
 }
 
+/// ENE KB9012 EC on its EDI pins.
+pub fn ene_edi() -> Wiring {
+    Wiring {
+        target: "KB9012 (EC)",
+        wires: vec![
+            (Pad::left(21), "EDICS (pin 59)"),
+            (Pad::left(22), "EDIDO (pin 62)"),
+            (Pad::left(24), "GND (pin 42)"),
+            (Pad::right(24), "EDIDI (pin 61)"),
+            (Pad::right(23), "EDICLK (pin 60)"),
+        ],
+        notes: vec![
+            SHORT,
+            "Power the laptop board from its own supply (EC standby power on); VCC is not \
+             connected to the programmer.",
+        ],
+    }
+}
+
 /// AVR microcontroller on its ISP pins.
 pub fn avr_isp() -> Wiring {
     Wiring {
@@ -263,6 +282,7 @@ pub fn diagrams(chip: Option<&VendorChip>) -> Vec<Diagram> {
     };
     match c.driver() {
         Some(Driver::Avr(..)) => vec![Diagram::Wires(avr_isp())],
+        Some(Driver::Ene(_)) => vec![Diagram::Wires(ene_edi())],
         Some(Driver::Spi(_) | Driver::SpiEeprom(_) | Driver::SpiNand(_))
             if package(c.name).is_some_and(|p| trailing_number(p) == Some(16)) =>
         {

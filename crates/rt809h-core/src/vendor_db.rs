@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 use crate::chips::{self, Chip};
 use crate::protocol::Voltage;
-use crate::{avr, i2c, image, spi_eeprom, spi_nand};
+use crate::{avr, ene, i2c, image, spi_eeprom, spi_nand};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Family {
@@ -91,6 +91,8 @@ pub enum Driver {
     SpiEeprom(u32),
     /// AVR microcontroller on the ISP header.
     Avr(&'static avr::AvrPart, avr::Memory),
+    /// ENE embedded controller, in circuit over EDI.
+    Ene(&'static ene::EnePart),
 }
 
 impl Driver {
@@ -103,6 +105,7 @@ impl Driver {
             Driver::SpiNand(n) => n.geometry.size(),
             Driver::Avr(p, avr::Memory::Flash) => p.flash,
             Driver::Avr(p, avr::Memory::Eeprom) => p.eeprom as u32,
+            Driver::Ene(p) => p.size,
         }
     }
 }
@@ -117,6 +120,11 @@ pub struct SpiNandPart {
 
 impl VendorChip {
     pub fn driver(&self) -> Option<Driver> {
+        if self.family == Family::Mcu && self.algo == "ALGO_KB9012" {
+            if let Some(p) = ene::find(self.name) {
+                return Some(Driver::Ene(p));
+            }
+        }
         if self.family == Family::Mcu {
             if let Some(p) = avr::find(self.name) {
                 return Some(Driver::Avr(p, avr::Memory::Flash));

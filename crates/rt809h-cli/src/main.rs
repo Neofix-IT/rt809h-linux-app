@@ -223,7 +223,7 @@ fn prepare(cli: &Cli) -> Result<(Programmer, DetectedChip)> {
 fn run_part(cli: &Cli, d: &Driver) -> Result<()> {
     let mut p = Programmer::connect_with_log(Box::new(|m| eprintln!("{m}")))?;
     p.spi_hz = cli.mhz.clamp(1, 30) * 1_000_000;
-    let eight_pin = !matches!(d, Driver::Image(..) | Driver::Avr(..));
+    let eight_pin = !matches!(d, Driver::Image(..) | Driver::Avr(..) | Driver::Ene(..));
     if eight_pin && !cli.no_contact_check {
         let v = match d {
             Driver::SpiNand(n) => n.voltage,

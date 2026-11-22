@@ -372,6 +372,10 @@ impl Programmer {
                 )
             }
             Driver::Avr(..) => self.avr_identify()?,
+            Driver::Ene(p) => {
+                self.with_ene(p, |_| Ok(()))?;
+                format!("{} answers on EDI", p.name)
+            }
             Driver::Spi(_) => return Err(Error::Chip("SPI NOR flash: use detect".into())),
         })
     }
@@ -385,6 +389,7 @@ impl Programmer {
                 self.with_spi_nand(n.voltage, n.geometry, n.id, |f| f.read(progress))
             }
             Driver::Image(i, s) => self.image_chip_read(i, &s, progress),
+            Driver::Ene(p) => self.with_ene(p, |e| e.read_flash(p, progress)),
             Driver::Avr(p, crate::avr::Memory::Flash) => {
                 self.with_avr(p, |i| i.read_flash(p, progress))
             }
@@ -448,6 +453,7 @@ impl Programmer {
                 full.resize(s.size as usize, 0xFF);
                 self.image_chip_write(i, &s, &full, progress)
             }
+            Driver::Ene(p) => self.with_ene(p, |e| e.write_flash(p, data, progress)),
             Driver::Avr(p, crate::avr::Memory::Flash) => self.with_avr(p, |i| {
                 note("Erasing (flash, EEPROM unless EESAVE is set, lock bits)".into());
                 i.chip_erase()?;
@@ -490,6 +496,7 @@ impl Programmer {
                 Err(Error::Chip("EPROMs are erased with UV light".into()))
             }
             Driver::Image(i, s) => self.image_chip_erase(i, &s, progress),
+            Driver::Ene(p) => self.with_ene(p, |e| e.erase(p, progress)),
             Driver::Avr(p, _) => {
                 note("Chip erase clears flash, EEPROM (unless EESAVE is set) and lock bits".into());
                 self.with_avr(p, |i| i.chip_erase())?;
@@ -652,6 +659,30 @@ impl Programmer {
             })();
             let _ = isp.release();
             r
+        })();
+        let off = self.mcu.leave_isp();
+        let v = res?;
+        off?;
+        Ok(v)
+    }
+}
+
+impl Programmer {
+    /// Reach an ENE EC over EDI (ISP contacts, board powered on its own),
+    /// hold its 8051 in reset and run `f`.
+    pub fn with_ene<T>(
+        &mut self,
+        part: &'static crate::ene::EnePart,
+        f: impl FnOnce(&mut crate::ene::Edi) -> Result<T>,
+    ) -> Result<T> {
+        self.mcu.enter_isp()?;
+        let res = (|| -> Result<T> {
+            let mut e = crate::ene::Edi::enter(&mut self.mcu.ftdi, part)?;
+            let r = f(&mut e);
+            let left = e.leave();
+            let v = r?;
+            left?;
+            Ok(v)
         })();
         let off = self.mcu.leave_isp();
         let v = res?;
