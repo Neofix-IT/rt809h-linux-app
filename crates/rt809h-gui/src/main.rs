@@ -106,6 +106,7 @@ struct App {
     volt: VoltChoice,
     chip: Option<Chip>,
     chip_filter: String,
+    chip_popup_open: bool,
     contact_check: bool,
     verify_after_write: bool,
     spi_mhz: u32,
@@ -144,6 +145,7 @@ impl App {
             volt: VoltChoice::Auto,
             chip: None,
             chip_filter: String::new(),
+            chip_popup_open: false,
             contact_check: true,
             verify_after_write: true,
             spi_mhz: 15,
@@ -478,45 +480,75 @@ impl App {
                 None => "Auto detect".into(),
             };
             let width = ui.available_width();
-            egui::ComboBox::from_id_salt("chip_sel")
+            let popup = egui::ComboBox::from_id_salt("chip_sel")
                 .width(width)
-                .height(380.0)
+                .height(440.0)
                 .selected_text(label)
+                // clicks inside (e.g. into the search field) must not close it
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                 .show_ui(ui, |ui| {
                     ui.set_min_width(width);
-                    ui.add(
+                    let search = ui.add(
                         egui::TextEdit::singleline(&mut self.chip_filter)
-                            .hint_text("Search, e.g. W25Q128 or MX25L")
+                            .hint_text("Type to search, e.g. W25Q128 or MX25L")
                             .desired_width(f32::INFINITY),
                     );
+                    if !self.chip_popup_open {
+                        // popup just opened: start typing right away
+                        search.request_focus();
+                        self.chip_popup_open = true;
+                    }
+                    let matches = chips::search(&self.chip_filter);
+                    if search.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        // Enter picks the first match (or auto detect)
+                        self.chip = if self.chip_filter.trim().is_empty() {
+                            None
+                        } else {
+                            matches.first().map(|c| **c).or(self.chip)
+                        };
+                        ui.close();
+                    }
                     ui.add_space(4.0);
-                    if ui
-                        .selectable_label(self.chip.is_none(), "Auto detect (recommended)")
-                        .clicked()
-                    {
-                        self.chip = None;
-                    }
-                    for c in chips::search(&self.chip_filter).into_iter().take(250) {
-                        let sel = self
-                            .chip
-                            .map(|x| x.id == c.id && x.name == c.name)
-                            .unwrap_or(false);
-                        let mut job = LayoutJob::default();
-                        job.append(
-                            &c.display_name(),
-                            0.0,
-                            TextFormat::simple(FontId::proportional(14.0), p.text),
-                        );
-                        job.append(
-                            &format!("   {} · {}", size_str(c.size), c.voltage),
-                            0.0,
-                            TextFormat::simple(FontId::proportional(12.0), p.dim),
-                        );
-                        if ui.selectable_label(sel, job).clicked() {
-                            self.chip = Some(*c);
-                        }
-                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("chip_list")
+                        .max_height(380.0)
+                        .show(ui, |ui| {
+                            if ui
+                                .selectable_label(self.chip.is_none(), "Auto detect (recommended)")
+                                .clicked()
+                            {
+                                self.chip = None;
+                                ui.close();
+                            }
+                            if matches.is_empty() {
+                                ui.label(RichText::new("No matching chip").color(p.dim));
+                            }
+                            for c in matches.iter().take(250) {
+                                let sel = self
+                                    .chip
+                                    .map(|x| x.id == c.id && x.name == c.name)
+                                    .unwrap_or(false);
+                                let mut job = LayoutJob::default();
+                                job.append(
+                                    &c.display_name(),
+                                    0.0,
+                                    TextFormat::simple(FontId::proportional(14.0), p.text),
+                                );
+                                job.append(
+                                    &format!("   {} · {}", size_str(c.size), c.voltage),
+                                    0.0,
+                                    TextFormat::simple(FontId::proportional(12.0), p.dim),
+                                );
+                                if ui.selectable_label(sel, job).clicked() {
+                                    self.chip = Some(**c);
+                                    ui.close();
+                                }
+                            }
+                        });
                 });
+            if popup.inner.is_none() {
+                self.chip_popup_open = false;
+            }
             ui.add_space(8.0);
             section(ui, p, "SUPPLY VOLTAGE");
             match self.chip {
