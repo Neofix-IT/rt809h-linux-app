@@ -33,6 +33,8 @@ pub enum Event {
     Connected(String),
     Disconnected,
     Detected(DetectedChip),
+    /// Result of a contact check: `None` = all pins OK.
+    Contact(Option<String>),
     Data(Vec<u8>),
     Finished(std::result::Result<String, String>),
 }
@@ -105,7 +107,9 @@ impl Worker {
                 .map(|c| c.voltage)
                 .or(s.voltage)
                 .unwrap_or(Voltage::V1_8);
-            if let Some(problem) = p.check_contact_8pin(v)? {
+            let problem = p.check_contact_8pin(v)?;
+            let _ = tx.send(Event::Contact(problem.clone()));
+            if let Some(problem) = problem {
                 return Err(Error::Chip(problem));
             }
             let _ = tx.send(Event::Log("Contact check OK".into()));
@@ -151,7 +155,9 @@ impl Worker {
                     .map(|c| c.voltage)
                     .or(s.voltage)
                     .unwrap_or(Voltage::V1_8);
-                match p.check_contact_8pin(v)? {
+                let problem = p.check_contact_8pin(v)?;
+                self.send(Event::Contact(problem.clone()));
+                match problem {
                     Some(problem) => Err(Error::Chip(problem)),
                     None => Ok("All 8 pins have good contact".into()),
                 }

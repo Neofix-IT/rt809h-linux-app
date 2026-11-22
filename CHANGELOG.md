@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Changed
+- Redesigned GUI: chip sidebar, operation tiles, progress with time left,
+  confirmation before erase and write, coloured hex view with go-to-address,
+  drag and drop, keyboard shortcuts (Ctrl+O, Ctrl+S, Ctrl+R, F5), light and
+  dark theme
+
 ## [0.1.0] - 2026-11-21
 
 ### Added
