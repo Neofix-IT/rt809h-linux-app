@@ -32,7 +32,8 @@ driven directly over USB (pure Rust, no libusb/libftdi needed).
 | 25xx/95xx SPI EEPROMs | native SPI | untested, needs a chip |
 | Parallel NOR, parallel EEPROM | programmer logic image | experimental |
 | EPROM (27Cxxx) | programmer logic image | experimental, read only |
-| NAND, eMMC, MCUs, PLDs | – | not supported |
+| AVR microcontrollers (ATmega, ATtiny, AT90USB) | native ISP | tested (ATmega328P) |
+| NAND, eMMC, other MCUs, PLDs | – | not supported |
 
 Parts without an ID (EEPROMs, SPI NAND, parallel chips) must be named with
 `--chip`, e.g. `rt809h --chip AT24C02 read dump.bin`.
@@ -43,6 +44,24 @@ this project. Copy that `LIB` folder to `~/.local/share/rt809h/algos` (or set
 `RT809H_ALGO_DIR`); an existing Wine installation is found automatically.
 "Experimental" means the supply settings were taken from a representative
 part of the same family; check the result with a verify before relying on it.
+
+### AVR over ISP
+
+Connect the target to the RT809H ISP header (MOSI, MISO, SCK, RESET, GND
+and VCC); the target board supplies its own power. The ISP clock is found
+automatically.
+
+```bash
+rt809h fuses                                       # identify the part, show fuses
+rt809h -c ATmega328P read flash.bin
+rt809h -c ATmega328P write flash.bin               # chip erase + program + verify
+rt809h -c ATmega328P --memory eeprom read ee.bin
+rt809h -c ATmega328P fuses --low 0xFF --high 0xDE  # program fuses
+```
+
+A flash write starts with a chip erase, which also clears the EEPROM unless
+the EESAVE fuse is set. Wrong fuse values (clock source, RSTDISBL, SPIEN) can
+lock the part out of ISP, so check them against the datasheet first.
 
 ## Install
 

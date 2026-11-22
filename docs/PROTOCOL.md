@@ -105,6 +105,24 @@ Bit-mode reads keep shifting into the same register, so a 1-bit read
 returns the previous bits above bit 0. Writes use the chip's page size and
 acknowledge polling.
 
+## AVR ISP header
+
+Runs on the power-up `BASE` logic. Rails: words as for I2C with level code
+`0xC2` (3.3 V) and word 14 = `0000`. Routing: `52 00 00` tail `01 01 01 01 01`
+(the connect bits stay clear; the SPI socket value `C0` does not reach the
+header). Then `SETBITMODE 0xFF RESET`, FTDI reset, latency 6 ms,
+`SETBITMODE 0x00 RESET`, `SETBITMODE 0x00 MPSSE`. Afterwards: RESET high,
+`SETBITMODE RESET`, re-init the channel and send `52 00 00` tail
+`00 00 00 00 01` to switch the header off. While the header is powered the MCU
+answers every other frame with `5A`; `01 03 00` tail `CD×5` clears that.
+
+ADBUS0 = SCK, ADBUS1 = MOSI, ADBUS2 = MISO, ADBUS3 = RESET, direction `0x0B`,
+12 MHz base clock (`86 div 00`, SCK = 6 MHz / (div + 1)). Programming mode:
+`80 00 0B`, `80 08 0B` (RESET pulse with SCK low), `80 02 0B`, wait 20 ms,
+then the standard AVR serial programming instructions (`AC 53 00 00`, ...).
+Flash reads are batched (4096 words per USB write) and replies must be read
+while the batch is being sent, or the FIFO fills up and the write stalls.
+
 ## Logic images
 
 Every other family needs a logic image in the programmer. The host uploads
