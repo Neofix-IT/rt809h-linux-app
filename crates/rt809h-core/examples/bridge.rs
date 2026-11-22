@@ -8,8 +8,11 @@
 //!
 //! Compatibility fix: some host software sends the SPI socket command (`52`)
 //! and the matching power-off (`01`) with mode byte bit 7 clear, which leaves
-//! the socket disconnected. The bridge sets that bit on the way out and
-//! restores the original frame in the MCU's echo.
+//! the socket disconnected. The same `52 00 00` frame is correct for the ISP
+//! header, so a `52` is forwarded as sent and only re-sent with bit 7 set
+//! when the host goes on to an SPI session (MPSSE on all pins) instead of
+//! reopening the channel for ISP. Power-off frames are fixed on the way out
+//! and the original is restored in the MCU's echo.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -29,6 +32,19 @@ fn fix_spi_mode(p: &[u8]) -> Option<[u8; 10]> {
         return None;
     }
     Some(frame(p[1], p[2], p[3] | 0x80, [1, 1, 1, 1, 1]))
+}
+
+/// Send a routing frame on our own (MCU sync pulse first) and drop its echo.
+fn resend_route(f: &mut Ftdi, frame: &[u8; 10]) -> rt809h_core::Result<()> {
+    f.set_bitmode_raw(0xFF, 0x02)?;
+    f.write(&[0x82, 0x00, 0x40])?;
+    std::thread::sleep(Duration::from_millis(3));
+    f.write(&[0x82, 0xFF, 0x00])?;
+    f.set_bitmode_raw(0xFF, 0x00)?;
+    std::thread::sleep(Duration::from_millis(50));
+    f.write(frame)?;
+    f.read_timeout(10, Duration::from_millis(500))?;
+    Ok(())
 }
 
 fn hex(b: &[u8]) -> String {
@@ -72,6 +88,8 @@ fn serve(mut s: TcpStream) -> std::io::Result<()> {
     // virtual chip (see emu.rs), configured by the file named in RT809H_EMU
     let mut vchip: Option<emu::Mpsse> = None;
     let mut bitmode: u8 = 0;
+    // corrected `52` frame to send if an SPI session follows
+    let mut pending_spi: Option<[u8; 10]> = None;
     loop {
         let mut hdr = [0u8; 6];
         s.read_exact(&mut hdr)?;
@@ -104,6 +122,7 @@ fn serve(mut s: TcpStream) -> std::io::Result<()> {
                     println!("{ts:9.4} [{ch}] OPEN");
                 }
                 3 => {
+                    pending_spi = None;
                     chans[ch] = None;
                     println!("{ts:9.4} [{ch}] CLOSE");
                 }
@@ -117,6 +136,7 @@ fn serve(mut s: TcpStream) -> std::io::Result<()> {
                         .ok_or_else(|| rt809h_core::Error::Usb("not open".into()))?;
                     match op {
                         4 => {
+                            pending_spi = None;
                             f.reset()?;
                             println!("{ts:9.4} [{ch}] RESET_DEVICE");
                         }
@@ -128,6 +148,10 @@ fn serve(mut s: TcpStream) -> std::io::Result<()> {
                             println!("{ts:9.4} [{ch}] PURGE mask={m}");
                         }
                         6 => {
+                            if let Some(fixed) = pending_spi.take().filter(|_| p == [0xFF, 0x02]) {
+                                resend_route(f, &fixed)?;
+                                println!("{ts:9.4} [{ch}] FIX SPI route -> {}", hex(&fixed));
+                            }
                             bitmode = p[1];
                             f.set_bitmode_raw(p[0], p[1])?;
                             println!(
@@ -159,7 +183,12 @@ fn serve(mut s: TcpStream) -> std::io::Result<()> {
                                     }
                                 }
                             }
-                            if let Some(fixed) = fix_spi_mode(&p) {
+                            pending_spi = None;
+                            let fixed = fix_spi_mode(&p);
+                            if let (Some(x), 0x52) = (fixed, p.get(1).copied().unwrap_or(0)) {
+                                pending_spi = Some(x);
+                                f.write(&p)?;
+                            } else if let Some(fixed) = fixed {
                                 let mut want: [u8; 10] = p[..].try_into().unwrap();
                                 want[0] = 0x55;
                                 let mut got = fixed;
