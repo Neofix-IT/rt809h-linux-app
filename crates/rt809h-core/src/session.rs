@@ -371,6 +371,7 @@ impl Programmer {
                     s.size
                 )
             }
+            Driver::Avr(..) => self.avr_identify()?,
             Driver::Spi(_) => return Err(Error::Chip("SPI NOR flash: use detect".into())),
         })
     }
@@ -384,6 +385,12 @@ impl Programmer {
                 self.with_spi_nand(n.voltage, n.geometry, n.id, |f| f.read(progress))
             }
             Driver::Image(i, s) => self.image_chip_read(i, &s, progress),
+            Driver::Avr(p, crate::avr::Memory::Flash) => {
+                self.with_avr(p, |i| i.read_flash(p, progress))
+            }
+            Driver::Avr(p, crate::avr::Memory::Eeprom) => {
+                self.with_avr(p, |i| i.read_eeprom(p, progress))
+            }
             Driver::Spi(_) => Err(Error::Chip("SPI NOR flash: use with_flash".into())),
         }
     }
@@ -441,6 +448,16 @@ impl Programmer {
                 full.resize(s.size as usize, 0xFF);
                 self.image_chip_write(i, &s, &full, progress)
             }
+            Driver::Avr(p, crate::avr::Memory::Flash) => self.with_avr(p, |i| {
+                note("Erasing (flash, EEPROM unless EESAVE is set, lock bits)".into());
+                i.chip_erase()?;
+                note("Programming".into());
+                i.write_flash(p, data, progress)
+            }),
+            Driver::Avr(p, crate::avr::Memory::Eeprom) => self.with_avr(p, |i| {
+                let old = i.read_eeprom(p, &mut |_, _| true)?;
+                i.write_eeprom(data, &old, progress)
+            }),
             Driver::Spi(_) => Err(Error::Chip("SPI NOR flash: use with_flash".into())),
         }
     }
@@ -473,6 +490,12 @@ impl Programmer {
                 Err(Error::Chip("EPROMs are erased with UV light".into()))
             }
             Driver::Image(i, s) => self.image_chip_erase(i, &s, progress),
+            Driver::Avr(p, _) => {
+                note("Chip erase clears flash, EEPROM (unless EESAVE is set) and lock bits".into());
+                self.with_avr(p, |i| i.chip_erase())?;
+                progress(1, 1);
+                Ok(())
+            }
             Driver::Spi(_) => Err(Error::Chip("SPI NOR flash: use with_flash".into())),
         }
     }
@@ -557,6 +580,83 @@ impl Programmer {
             std::thread::sleep(Duration::from_millis(50));
         }
         Err(last)
+    }
+}
+
+impl Programmer {
+    /// Power the ISP header, enter programming mode on `part` (its
+    /// signature must match) and run `f`. The part is released afterwards.
+    pub fn with_avr<T>(
+        &mut self,
+        part: &crate::avr::AvrPart,
+        f: impl FnOnce(&mut crate::avr::Isp) -> Result<T>,
+    ) -> Result<T> {
+        self.mcu.enter_isp()?;
+        let res = (|| {
+            let mut isp = crate::avr::Isp::enter(&mut self.mcu.ftdi)?;
+            let r = (|| {
+                let sig = isp.signature()?;
+                if sig != part.signature {
+                    let known = crate::avr::by_signature(sig);
+                    return Err(Error::Chip(format!(
+                        "Signature {:02X} {:02X} {:02X} does not match {} ({})",
+                        sig[0],
+                        sig[1],
+                        sig[2],
+                        part.name,
+                        if known.is_empty() {
+                            "unknown part".to_string()
+                        } else {
+                            format!("found {}", known.join(" / "))
+                        }
+                    )));
+                }
+                f(&mut isp)
+            })();
+            let _ = isp.release();
+            r
+        })();
+        let off = self.mcu.leave_isp();
+        let v = res?;
+        off?;
+        Ok(v)
+    }
+
+    /// Identify the AVR on the ISP header: signature, matching part names,
+    /// fuses and the ISP clock that works.
+    pub fn avr_identify(&mut self) -> Result<String> {
+        self.mcu.enter_isp()?;
+        let res = (|| {
+            let mut isp = crate::avr::Isp::enter(&mut self.mcu.ftdi)?;
+            let r = (|| -> Result<String> {
+                let sig = isp.signature()?;
+                let names = crate::avr::by_signature(sig);
+                let fuse_count = names
+                    .first()
+                    .and_then(|n| crate::avr::find(n))
+                    .map_or(3, |p| p.fuses);
+                let fuses = isp.fuses(fuse_count)?;
+                Ok(format!(
+                    "Signature {:02X} {:02X} {:02X} ({}), {}, ISP clock {} kHz",
+                    sig[0],
+                    sig[1],
+                    sig[2],
+                    if names.is_empty() {
+                        "unknown part".to_string()
+                    } else {
+                        names.join(" / ")
+                    },
+                    fuses,
+                    isp.clock_hz() / 1000
+                ))
+            })();
+            let _ = isp.release();
+            r
+        })();
+        let off = self.mcu.leave_isp();
+        let v = res?;
+        off?;
+        Ok(v)
     }
 }
 

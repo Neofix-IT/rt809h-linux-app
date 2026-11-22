@@ -1,5 +1,6 @@
 //! Core library for the RT809H universal programmer.
 
+pub mod avr;
 pub mod chips;
 pub mod emu;
 pub mod ftdi;

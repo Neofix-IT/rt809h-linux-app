@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 use crate::chips::{self, Chip};
 use crate::protocol::Voltage;
-use crate::{i2c, image, spi_eeprom, spi_nand};
+use crate::{avr, i2c, image, spi_eeprom, spi_nand};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Family {
@@ -89,6 +89,8 @@ pub enum Driver {
     SpiNand(SpiNandPart),
     /// 25xx/95xx SPI EEPROM of this many bytes.
     SpiEeprom(u32),
+    /// AVR microcontroller on the ISP header.
+    Avr(&'static avr::AvrPart, avr::Memory),
 }
 
 impl Driver {
@@ -99,6 +101,8 @@ impl Driver {
             Driver::I2c(n) | Driver::SpiEeprom(n) => *n,
             Driver::Image(_, s) => s.size,
             Driver::SpiNand(n) => n.geometry.size(),
+            Driver::Avr(p, avr::Memory::Flash) => p.flash,
+            Driver::Avr(p, avr::Memory::Eeprom) => p.eeprom as u32,
         }
     }
 }
@@ -113,6 +117,11 @@ pub struct SpiNandPart {
 
 impl VendorChip {
     pub fn driver(&self) -> Option<Driver> {
+        if self.family == Family::Mcu {
+            if let Some(p) = avr::find(self.name) {
+                return Some(Driver::Avr(p, avr::Memory::Flash));
+            }
+        }
         match self.family {
             Family::Spi
                 if ["25_", "ALGO_25_", "ALGO_SPI_1_OTP", "S25FL_"]
@@ -237,6 +246,18 @@ pub fn all() -> &'static [VendorChip] {
                     page: f.next().and_then(|v| v.parse().ok()).unwrap_or(0),
                 })
             })
+            .chain(avr::PARTS.iter().map(|p| VendorChip {
+                family: Family::Mcu,
+                maker: "Microchip (Atmel)",
+                name: p.name,
+                size: p.flash,
+                id: u32::from_be_bytes([0, p.signature[0], p.signature[1], p.signature[2]]),
+                algo: "AVR_ISP",
+                t_erase: 0,
+                t_program: 0,
+                buffer: p.page as u32,
+                page: 0,
+            }))
             .collect()
     })
 }
@@ -326,6 +347,8 @@ mod tests {
                 image::nor::setup(0x80000, 50000, 500)
             ))
         );
+        let a = find("ATmega328P").unwrap();
+        assert!(matches!(a.driver(), Some(Driver::Avr(p, _)) if p.flash == 32768));
         let m = find("93C46").unwrap();
         assert_eq!(
             m.driver(),

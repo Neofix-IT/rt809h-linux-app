@@ -312,6 +312,37 @@ impl Mcu {
         Ok(())
     }
 
+    /// Power the ISP header (3.3 V logic) and hand its lines to MPSSE.
+    pub fn enter_isp(&mut self) -> Result<()> {
+        let mut words: [u16; 20] = [0x0211; 20];
+        words[0] = 0x0010;
+        words[1] = Voltage::V3_3.level_code();
+        words[2] = 0x00EA;
+        words[14] = 0x0000;
+        for i in [15, 18, 19] {
+            words[i] = Voltage::V3_3.rail_code();
+        }
+        let payload: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        self.command(CMD_SET_RAILS, 0x14, 0x00, PAD)?;
+        self.ftdi.write(&payload)?;
+        self.ftdi.read_exact(40)?;
+        self.command(CMD_SET_MODE, 0x00, 0x00, [1, 1, 1, 1, 1])?;
+        self.ftdi.set_bitmode(0xFF, BitMode::Reset)?;
+        self.ftdi.reset()?;
+        self.ftdi.set_latency(6)?;
+        self.ftdi.set_bitmode(0x00, BitMode::Reset)?;
+        self.ftdi.set_bitmode(0x00, BitMode::Mpsse)?;
+        std::thread::sleep(Duration::from_millis(50));
+        Ok(())
+    }
+
+    /// Give the ISP lines back to the MCU and switch the header off.
+    pub fn leave_isp(&mut self) -> Result<()> {
+        self.ftdi.set_bitmode(0x00, BitMode::Reset)?;
+        self.reinit()?;
+        self.command(CMD_SET_MODE, 0x00, 0x00, [0, 0, 0, 0, 1])
+    }
+
     /// Power off after `enter_bitbang`.
     pub fn power_off_bitbang(&mut self, mode: u8) -> Result<()> {
         self.ftdi.set_bitmode(0xFF, BitMode::Reset)?;
