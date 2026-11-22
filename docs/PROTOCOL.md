@@ -82,3 +82,96 @@ Session order: `56` (rails) → `3A` (contact) → `52 00 C0`, then
 ADBUS0 = SCK, ADBUS1 = MOSI, ADBUS2 = MISO, ADBUS3 = CS#, direction `0x0B`.
 SPI mode 0 (`0x11` out on falling edge, `0x20` in on rising edge), 60 MHz base
 clock with `0x8A`. Standard 25-series opcodes from there on.
+
+## I2C EEPROMs (24xx)
+
+Runs on the power-up `BASE` logic. Rails as for SPI but level code `0xC0`
+(3.3 V). Routing: `52 00 00` tail `01 00 00 00 00`; power off with `01 00 00`
+tail `01 00 00 00 00`, then the ACBUS7 pulse. (Captured from host software
+under Wine, which is known to clear the connect bits for SPI; the driver
+falls back to `80`/`C0` if nothing acknowledges.)
+
+The bus is bit-banged with MPSSE GPIO writes, 100 kHz (`86 3B 00`):
+ADBUS0 = SCL, ADBUS1 = SDA out, ADBUS2 = SDA in, direction `0x13` while
+driving SDA, `0x11` to release it, `0x10` when idle.
+
+- START: `80 03 13` ×4, `80 01 13` ×8, `80 00 13` ×4
+- byte out: `11 00 00 bb`, ACK read: `80 02 11` ×3, `22 00`, `87`
+- byte in: `80 02 13` ×2, `24 00 00`, then `80 00 13` (ACK) or
+  `80 02 13` (NACK) and `8E 00`
+- STOP: `80 02 13`, `80 00 13`, `80 01 13` ×4, `80 03 13` ×8, `80 00 10`
+
+Bit-mode reads keep shifting into the same register, so a 1-bit read
+returns the previous bits above bit 0. Writes use the chip's page size and
+acknowledge polling.
+
+## Logic images
+
+Every other family needs a logic image in the programmer. The host uploads
+it when the chip is selected:
+
+```
+A5 AA 55  tail 00 CD CD CD CD       back to BASE first (if another image is loaded)
+5A 55 AA  tail CD CD CD CD n        then n blocks of 32 KiB, each answered by 1 byte
+EA                                  → 256 bytes, byte 0 = 1, name from byte 1 ("ALGO_NOR_8_1")
+```
+
+The blocks are the image file as distributed with the vendor software
+(`LIB/ALGO_*.DAT`), padded with `FF` to a multiple of 32 KiB. No image is
+included in this project.
+
+With an image loaded every frame uses the tail `EE 00 00 00 1E` and the
+chip operations are executed by the MCU:
+
+| cmd | data | meaning |
+|-----|------|---------|
+| `56` | → 40, ← 40 | rails (as above, level code e.g. `0x9E` for 93xx, `0xA8` for parallel NOR) |
+| `3A` | → 12, ← 48 | contact scan |
+| `52` | → 256, ← 1 | chip parameters (see below) |
+| `61` | ← 256 | read ID (parallel flash: byte 0/1 = maker/device) |
+| `65` | ← size | read the chip (64 KiB transfers) |
+| `6A` | ← size | read again (verify pass) |
+| `7A` | → size, ← `AA 55` | program the chip |
+| `85` | ← 1 (`AA`) | erase the whole chip; the answer comes when the erase finishes or the part's erase timeout (units of 10 ms) runs out |
+
+Parameter block (little endian), first 40 bytes; the rest is zero in the
+captures. The rail words repeat the `56` table; the other fields come from
+the part record or are fixed per logic image.
+
+| offset | source | 93C46 | SST39SF040 | 28F320 (16-bit) | EN29GL064B (8-bit) |
+|--------|--------|-------|------------|-----------------|--------------------|
+| 0 u32 | capacity | `0x80` | `0x80000` | `0x200000` | `0x800000` |
+| 6 u16 | rail word 1 (logic level) | `0x9E` | `0xA8` | `0xC4` | `0xC4` |
+| 8 u16 | rail word 2 | `0x212` | `0x212` | `0x8D` | `0x212` |
+| 10 u16 | rail word 3 | `0x211` | `0x211` | `0x211` | `0x211` |
+| 12 u16 | rail word 15 (Vpp) | `0x294` | `0x294` | `0x294` | `0x294` |
+| 14 u16 | rail word 18 (Vcc) | `0x294` | `0x258` | `0x294` | `0x294` |
+| 16 u32 | erase timeout | 0 | 50000 | 65000 | 0 |
+| 20 u32 | program timeout | 0 | 500 | 1000 | 200 |
+| 24 u32 | write buffer | 8 | 8 | 8 | 32 |
+| 28 u16 | page | 0x100 | 0x100 | 0x100 | 0x100 |
+| 30 u16 | image flag | 0 | 0 | 0 | 1 |
+| 32 u32 | fixed | 0x100000 | 0x100000 | 0x100000 | 0x100000 |
+| 36 u32 | image flag | 1 | 1 | 0x80000001 | 1 |
+
+The per-image values (rail words 1/2/15/18 and the two flags) are kept in
+`image::PROFILES`; capacity, timeouts, buffer and page come from the part
+list.
+
+After an operation the host pulses ACBUS7 (`82 00 80`) and resets the FTDI.
+
+## Part list
+
+`crates/rt809h-core/data/vendor_chips.tsv` lists every part the vendor
+software offers, with its family, capacity, JEDEC ID (SPI) and the logic
+image / algorithm it uses, plus the erase/program timeouts and the
+buffer/page fields of the part record (`t_erase`, `t_program`, `buffer`,
+`page`). Families by part count: SPI flash, I2C EEPROM, parallel NOR,
+Microwire, MCUs, EPROM, eMMC, NAND, parallel EEPROM, PLD.
+
+Rail word 1 (logic level) is set per part by the vendor software, roughly
+`3.3 V - (code - 0xC2) * 0.05 V` (`0x9E` ≈ 5.1 V, `0xA8` ≈ 4.6 V, `0xC8` ≈ 3.0 V,
+`0xDC` ≈ 2.0 V). The part list does not carry it, so image profiles use the
+lowest level captured for that image. Parallel NAND additionally needs the
+page count (offset 0), page size and pages per block (u16 at 24 and 26) and
+further geometry bytes from offset 52; it is not implemented.

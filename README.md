@@ -21,15 +21,28 @@ driven directly over USB (pure Rust, no libusb/libftdi needed).
 
 ## What is supported
 
-The app currently covers **SPI flashing only**: 25-series SPI NOR flash in the
-ZIF socket (8-pin, pushed to the bottom of the socket). See `rt809h chips` for
-the chip database; unknown 25-series chips are sized through SFDP/JEDEC.
+`rt809h chips --stats` prints the current coverage of the full part list.
 
-The RT809H itself supports many more protocols and chip families (I²C 24xx
-EEPROMs, Microwire 93xx, parallel NOR/EPROM, NAND, eMMC, MCUs, ISP, …). These
-are **not supported yet**. Adding them is possible, but each family needs its
-own protocol work and testing with real chips, so contributions and test
-reports are welcome.
+| Family | How | Status |
+|--------|-----|--------|
+| 25-series SPI NOR flash | native SPI | tested |
+| 24xx I²C EEPROMs | native bit-banged I²C | tested against an emulated chip, needs a real one |
+| 93xx Microwire EEPROMs | programmer logic image | read flow tested (empty socket) |
+| SPI NAND (W25N, MX35, GD5F, …) | native SPI | untested, needs a chip |
+| 25xx/95xx SPI EEPROMs | native SPI | untested, needs a chip |
+| Parallel NOR, parallel EEPROM | programmer logic image | experimental |
+| EPROM (27Cxxx) | programmer logic image | experimental, read only |
+| NAND, eMMC, MCUs, PLDs | – | not supported |
+
+Parts without an ID (EEPROMs, SPI NAND, parallel chips) must be named with
+`--chip`, e.g. `rt809h --chip AT24C02 read dump.bin`.
+
+The families marked "logic image" need the programmer logic files
+(`LIB/ALGO_*.DAT`) from the vendor's Windows software, which are not part of
+this project. Copy that `LIB` folder to `~/.local/share/rt809h/algos` (or set
+`RT809H_ALGO_DIR`); an existing Wine installation is found automatically.
+"Experimental" means the supply settings were taken from a representative
+part of the same family; check the result with a verify before relying on it.
 
 ## Install
 
@@ -68,6 +81,7 @@ rt809h write firmware.bin
 rt809h verify firmware.bin
 rt809h erase
 rt809h --voltage 1.8 detect      # force a supply voltage
+rt809h --chip 93C46 read eeprom.bin   # parts without an ID need --chip
 rt809h contact                   # contact test only
 ```
 
