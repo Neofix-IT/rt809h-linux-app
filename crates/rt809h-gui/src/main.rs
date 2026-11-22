@@ -110,6 +110,7 @@ struct App {
     contact_check: bool,
     verify_after_write: bool,
     spi_mhz: u32,
+    avr_eeprom: bool,
     buffer: Option<Buffer>,
     running: Option<Running>,
     status: Option<(bool, String)>,
@@ -148,6 +149,7 @@ impl App {
             chip_popup_open: false,
             contact_check: true,
             verify_after_write: true,
+            avr_eeprom: false,
             spi_mhz: 15,
             buffer: None,
             running: None,
@@ -174,6 +176,7 @@ impl App {
             chip: self.chip,
             contact_check: self.contact_check,
             spi_mhz: self.spi_mhz,
+            eeprom: self.avr_eeprom,
         }
     }
 
@@ -570,6 +573,18 @@ impl App {
                         RichText::new(format!("{} (set by the selected chip)", c.voltage))
                             .color(p.dim),
                     );
+                }
+                Some(Driver::Avr(..)) => {
+                    ui.label(
+                        RichText::new("Powered by the target board (ISP header, 3.3 V logic)")
+                            .color(p.dim),
+                    );
+                    ui.add_space(8.0);
+                    section(ui, p, "MEMORY");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.avr_eeprom, false, "Flash");
+                        ui.selectable_value(&mut self.avr_eeprom, true, "EEPROM");
+                    });
                 }
                 Some(_) => {
                     ui.label(RichText::new("Set by the selected chip").color(p.dim));

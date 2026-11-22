@@ -14,12 +14,17 @@ pub struct Settings {
     pub chip: Option<&'static VendorChip>,
     pub contact_check: bool,
     pub spi_mhz: u32,
+    /// work on the EEPROM instead of the flash of a microcontroller
+    pub eeprom: bool,
 }
 
 impl Settings {
     /// Native driver for the selected part (`None` = auto detect).
     pub fn driver(&self) -> Option<Driver> {
-        self.chip.and_then(|c| c.driver())
+        self.chip.and_then(|c| c.driver()).map(|d| match d {
+            Driver::Avr(p, _) if self.eeprom => Driver::Avr(p, rt809h_core::avr::Memory::Eeprom),
+            d => d,
+        })
     }
 
     fn spi_chip(&self) -> Option<rt809h_core::chips::Chip> {
