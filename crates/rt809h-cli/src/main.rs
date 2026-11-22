@@ -11,7 +11,7 @@ use rt809h_core::{DetectedChip, Error, Programmer, Result, Voltage};
 #[command(
     name = "rt809h",
     version,
-    about = "RT809H programmer for SPI flash and I2C EEPROMs"
+    about = "RT809H programmer for flash memories, EEPROMs and AVR microcontrollers"
 )]
 struct Cli {
     /// Chip supply voltage (auto ramps 1.8 -> 2.5 -> 3.3 V and then uses the
@@ -28,8 +28,17 @@ struct Cli {
     /// cannot be identified automatically.
     #[arg(long, short = 'c', global = true)]
     chip: Option<String>,
+    /// Memory of a microcontroller to work on.
+    #[arg(long, value_enum, default_value_t = Mem::Flash, global = true)]
+    memory: Mem,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq)]
+enum Mem {
+    Flash,
+    Eeprom,
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq)]
@@ -80,6 +89,22 @@ enum Cmd {
     Erase,
     /// Check whether the chip is blank (all 0xFF).
     Blank,
+    /// Show (or program) the fuse and lock bytes of an AVR on the ISP
+    /// header. Without --chip the part is identified by its signature.
+    Fuses {
+        /// New low fuse byte, e.g. 0xE2.
+        #[arg(long, value_parser = parse_byte)]
+        low: Option<u8>,
+        /// New high fuse byte.
+        #[arg(long, value_parser = parse_byte)]
+        high: Option<u8>,
+        /// New extended fuse byte.
+        #[arg(long, value_parser = parse_byte)]
+        extended: Option<u8>,
+        /// New lock byte.
+        #[arg(long, value_parser = parse_byte)]
+        lock: Option<u8>,
+    },
     /// List supported chips (optionally filtered).
     Chips {
         filter: Option<String>,
@@ -90,6 +115,50 @@ enum Cmd {
         #[arg(long)]
         stats: bool,
     },
+}
+
+fn parse_byte(s: &str) -> std::result::Result<u8, String> {
+    let t = s.trim_start_matches("0x").trim_start_matches("0X");
+    u8::from_str_radix(t, 16).map_err(|_| format!("{s} is not a hex byte"))
+}
+
+fn run_fuses(cli: &Cli) -> Result<()> {
+    let Cmd::Fuses {
+        low,
+        high,
+        extended,
+        lock,
+    } = cli.cmd
+    else {
+        unreachable!()
+    };
+    let mut p = Programmer::connect_with_log(Box::new(|m| eprintln!("{m}")))?;
+    let part = match target(cli)? {
+        Some(Driver::Avr(part, _)) => part,
+        Some(_) => {
+            return Err(Error::Chip(
+                "Fuses exist on AVR microcontrollers only".into(),
+            ))
+        }
+        None if [low, high, extended, lock].iter().all(Option::is_none) => {
+            println!("{}", p.avr_identify()?);
+            return Ok(());
+        }
+        None => {
+            return Err(Error::Chip(
+                "Name the part with --chip to program fuses".into(),
+            ))
+        }
+    };
+    if extended.is_some() && part.fuses < 3 {
+        return Err(Error::Chip(format!("{} has no extended fuse", part.name)));
+    }
+    let f = p.with_avr(part, |i| {
+        i.write_fuses(low, high, extended, lock)?;
+        i.fuses(part.fuses)
+    })?;
+    println!("{}: {f}", part.name);
+    Ok(())
 }
 
 fn bar(msg: &str) -> ProgressBar {
@@ -119,7 +188,11 @@ fn target(cli: &Cli) -> Result<Option<Driver>> {
     };
     let c = vendor_db::find(name)
         .ok_or_else(|| Error::Chip(format!("Unknown part {name}; see `rt809h chips {name}`")))?;
-    c.driver().map(Some).ok_or_else(|| {
+    let d = c.driver().map(|d| match (d, cli.memory) {
+        (Driver::Avr(p, _), Mem::Eeprom) => Driver::Avr(p, rt809h_core::avr::Memory::Eeprom),
+        (d, _) => d,
+    });
+    d.map(Some).ok_or_else(|| {
         Error::Chip(format!(
             "{} ({}) is not supported by the native driver yet",
             c.name,
@@ -150,7 +223,7 @@ fn prepare(cli: &Cli) -> Result<(Programmer, DetectedChip)> {
 fn run_part(cli: &Cli, d: &Driver) -> Result<()> {
     let mut p = Programmer::connect_with_log(Box::new(|m| eprintln!("{m}")))?;
     p.spi_hz = cli.mhz.clamp(1, 30) * 1_000_000;
-    let eight_pin = !matches!(d, Driver::Image(..));
+    let eight_pin = !matches!(d, Driver::Image(..) | Driver::Avr(..));
     if eight_pin && !cli.no_contact_check {
         let v = match d {
             Driver::SpiNand(n) => n.voltage,
@@ -215,6 +288,9 @@ fn run_part(cli: &Cli, d: &Driver) -> Result<()> {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    if matches!(cli.cmd, Cmd::Fuses { .. }) {
+        return run_fuses(&cli);
+    }
     if !matches!(cli.cmd, Cmd::Chips { .. } | Cmd::Info | Cmd::Contact) {
         match target(&cli)? {
             Some(Driver::Spi(_)) | None => {}
@@ -222,6 +298,7 @@ fn run(cli: Cli) -> Result<()> {
         }
     }
     match &cli.cmd {
+        Cmd::Fuses { .. } => unreachable!(),
         Cmd::Chips { filter, all, stats } => {
             if *stats {
                 let (mut sup, mut tot) = (0, 0);
