@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-23
+
 ### Added
 - Full part list: pick any chip by name in the GUI or with `--chip`
 - 24xx I²C EEPROMs, 25xx/95xx SPI EEPROMs and SPI NAND drivers

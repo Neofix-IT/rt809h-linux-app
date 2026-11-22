@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/rt809h-core", "crates/rt809h-cli", "crates/rt809h-gui"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Neofix-IT/rt809h-linux-app"

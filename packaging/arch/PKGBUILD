@@ -1,6 +1,6 @@
 # Maintainer: Neofix <info@neofix.ch>
 pkgname=rt809h
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Native Linux app and CLI for the RT809H universal programmer (SPI flash)"
 arch=('x86_64' 'aarch64')

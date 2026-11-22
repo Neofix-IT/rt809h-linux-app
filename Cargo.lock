@@ -2215,7 +2215,7 @@ dependencies = [
 
 [[package]]
 name = "rt809h-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "env_logger",
@@ -2225,7 +2225,7 @@ dependencies = [
 
 [[package]]
 name = "rt809h-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "log",
  "nusb",
@@ -2234,7 +2234,7 @@ dependencies = [
 
 [[package]]
 name = "rt809h-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eframe",
  "env_logger",
