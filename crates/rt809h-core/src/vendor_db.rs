@@ -254,13 +254,16 @@ pub fn all() -> &'static [VendorChip] {
                     page: f.next().and_then(|v| v.parse().ok()).unwrap_or(0),
                 })
             })
-            .chain(avr::PARTS.iter().map(|p| VendorChip {
+            .chain(avr::all_parts().map(|p| VendorChip {
                 family: Family::Mcu,
                 maker: "Microchip (Atmel)",
                 name: p.name,
                 size: p.flash,
                 id: u32::from_be_bytes([0, p.signature[0], p.signature[1], p.signature[2]]),
-                algo: "AVR_ISP",
+                algo: match p.bus {
+                    avr::Bus::Isp => "AVR_ISP",
+                    avr::Bus::Updi(_) => "AVR_UPDI",
+                },
                 t_erase: 0,
                 t_program: 0,
                 buffer: p.page as u32,

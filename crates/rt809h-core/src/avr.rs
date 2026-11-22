@@ -1,6 +1,7 @@
 //! Atmel/Microchip AVR microcontrollers over the ISP header (SPI serial
 //! programming, as described in the "Serial Downloading" chapter of the AVR
-//! datasheets).
+//! datasheets). Newer parts with a UPDI pin are handled by [`crate::updi`]
+//! on the same lines.
 //!
 //! The programmer routes its FTDI MPSSE lines to the ISP header:
 //! ADBUS0 = SCK, ADBUS1 = MOSI, ADBUS2 = MISO, ADBUS3 = RESET.
@@ -24,6 +25,36 @@ pub struct AvrPart {
     pub eeprom: u16,
     /// number of fuse bytes (2 = low/high, 3 = low/high/extended)
     pub fuses: u8,
+    /// how the part is programmed
+    pub bus: Bus,
+}
+
+/// Programming interface of an AVR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bus {
+    /// SPI serial programming (MOSI, MISO, SCK, RESET)
+    Isp,
+    /// one-wire UPDI
+    Updi(UpdiFamily),
+}
+
+/// UPDI part families (they differ in memory map and NVM controller).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdiFamily {
+    /// tinyAVR 0/1/2-series
+    Tiny,
+    /// megaAVR 0-series (ATmega808 … ATmega4809)
+    Mega0,
+    /// AVR DA/DB
+    Dx,
+    /// AVR DD (UPDI pin can be made a GPIO)
+    Dd,
+    /// AVR DU (USB; word writes like DD, newer NVM controller "P:4")
+    Du,
+    /// AVR EA (page buffer, NVM controller "P:3")
+    Ea,
+    /// AVR EB (page buffer, NVM controller "P:5")
+    Eb,
 }
 
 const fn p(name: &'static str, sig: u32, flash: u32, page: u16, eeprom: u16, fuses: u8) -> AvrPart {
@@ -34,6 +65,22 @@ const fn p(name: &'static str, sig: u32, flash: u32, page: u16, eeprom: u16, fus
         page,
         eeprom,
         fuses,
+        bus: Bus::Isp,
+    }
+}
+
+const fn u(
+    name: &'static str,
+    sig: u32,
+    flash: u32,
+    page: u16,
+    eeprom: u16,
+    fam: UpdiFamily,
+) -> AvrPart {
+    AvrPart {
+        bus: Bus::Updi(fam),
+        fuses: crate::updi::FUSES as u8,
+        ..p(name, sig, flash, page, eeprom, 0)
     }
 }
 
@@ -125,16 +172,149 @@ pub static PARTS: &[AvrPart] = &[
     p("AT90USB1287", 0x1E9782, 131072, 256, 4096, 3),
 ];
 
+use UpdiFamily::{Dd, Du, Dx, Ea, Eb, Mega0, Tiny};
+
+/// Parts programmed over UPDI, from the device datasheets.
+pub static UPDI_PARTS: &[AvrPart] = &[
+    u("ATtiny202", 0x1E9123, 2048, 64, 64, Tiny),
+    u("ATtiny204", 0x1E9122, 2048, 64, 64, Tiny),
+    u("ATtiny212", 0x1E9121, 2048, 64, 64, Tiny),
+    u("ATtiny214", 0x1E9120, 2048, 64, 64, Tiny),
+    u("ATtiny402", 0x1E9227, 4096, 64, 128, Tiny),
+    u("ATtiny404", 0x1E9226, 4096, 64, 128, Tiny),
+    u("ATtiny406", 0x1E9225, 4096, 64, 128, Tiny),
+    u("ATtiny412", 0x1E9223, 4096, 64, 128, Tiny),
+    u("ATtiny414", 0x1E9222, 4096, 64, 128, Tiny),
+    u("ATtiny416", 0x1E9221, 4096, 64, 128, Tiny),
+    u("ATtiny417", 0x1E9220, 4096, 64, 128, Tiny),
+    u("ATtiny424", 0x1E922C, 4096, 64, 128, Tiny),
+    u("ATtiny426", 0x1E922B, 4096, 64, 128, Tiny),
+    u("ATtiny427", 0x1E922A, 4096, 64, 128, Tiny),
+    u("ATtiny804", 0x1E9325, 8192, 64, 128, Tiny),
+    u("ATtiny806", 0x1E9324, 8192, 64, 128, Tiny),
+    u("ATtiny807", 0x1E9323, 8192, 64, 128, Tiny),
+    u("ATtiny814", 0x1E9322, 8192, 64, 128, Tiny),
+    u("ATtiny816", 0x1E9321, 8192, 64, 128, Tiny),
+    u("ATtiny817", 0x1E9320, 8192, 64, 128, Tiny),
+    u("ATtiny824", 0x1E9329, 8192, 64, 128, Tiny),
+    u("ATtiny826", 0x1E9328, 8192, 64, 128, Tiny),
+    u("ATtiny827", 0x1E9327, 8192, 64, 128, Tiny),
+    u("ATtiny1604", 0x1E9425, 16384, 64, 256, Tiny),
+    u("ATtiny1606", 0x1E9424, 16384, 64, 256, Tiny),
+    u("ATtiny1607", 0x1E9423, 16384, 64, 256, Tiny),
+    u("ATtiny1614", 0x1E9422, 16384, 64, 256, Tiny),
+    u("ATtiny1616", 0x1E9421, 16384, 64, 256, Tiny),
+    u("ATtiny1617", 0x1E9420, 16384, 64, 256, Tiny),
+    u("ATtiny1624", 0x1E942A, 16384, 64, 256, Tiny),
+    u("ATtiny1626", 0x1E9429, 16384, 64, 256, Tiny),
+    u("ATtiny1627", 0x1E9428, 16384, 64, 256, Tiny),
+    u("ATtiny3216", 0x1E9521, 32768, 128, 256, Tiny),
+    u("ATtiny3217", 0x1E9522, 32768, 128, 256, Tiny),
+    u("ATtiny3224", 0x1E9528, 32768, 128, 256, Tiny),
+    u("ATtiny3226", 0x1E9527, 32768, 128, 256, Tiny),
+    u("ATtiny3227", 0x1E9526, 32768, 128, 256, Tiny),
+    u("ATmega808", 0x1E9326, 8192, 64, 256, Mega0),
+    u("ATmega809", 0x1E932A, 8192, 64, 256, Mega0),
+    u("ATmega1608", 0x1E9427, 16384, 64, 256, Mega0),
+    u("ATmega1609", 0x1E9426, 16384, 64, 256, Mega0),
+    u("ATmega3208", 0x1E9530, 32768, 128, 256, Mega0),
+    u("ATmega3209", 0x1E9531, 32768, 128, 256, Mega0),
+    u("ATmega4808", 0x1E9650, 49152, 128, 256, Mega0),
+    u("ATmega4809", 0x1E9651, 49152, 128, 256, Mega0),
+    u("AVR32DA28", 0x1E9534, 32768, 512, 512, Dx),
+    u("AVR32DA32", 0x1E9533, 32768, 512, 512, Dx),
+    u("AVR32DA48", 0x1E9532, 32768, 512, 512, Dx),
+    u("AVR64DA28", 0x1E9615, 65536, 512, 512, Dx),
+    u("AVR64DA32", 0x1E9614, 65536, 512, 512, Dx),
+    u("AVR64DA48", 0x1E9613, 65536, 512, 512, Dx),
+    u("AVR64DA64", 0x1E9612, 65536, 512, 512, Dx),
+    u("AVR128DA28", 0x1E970A, 131072, 512, 512, Dx),
+    u("AVR128DA32", 0x1E9709, 131072, 512, 512, Dx),
+    u("AVR128DA48", 0x1E9708, 131072, 512, 512, Dx),
+    u("AVR128DA64", 0x1E9707, 131072, 512, 512, Dx),
+    u("AVR32DB28", 0x1E9537, 32768, 512, 512, Dx),
+    u("AVR32DB32", 0x1E9536, 32768, 512, 512, Dx),
+    u("AVR32DB48", 0x1E9535, 32768, 512, 512, Dx),
+    u("AVR64DB28", 0x1E9619, 65536, 512, 512, Dx),
+    u("AVR64DB32", 0x1E9618, 65536, 512, 512, Dx),
+    u("AVR64DB48", 0x1E9617, 65536, 512, 512, Dx),
+    u("AVR64DB64", 0x1E9616, 65536, 512, 512, Dx),
+    u("AVR128DB28", 0x1E970E, 131072, 512, 512, Dx),
+    u("AVR128DB32", 0x1E970D, 131072, 512, 512, Dx),
+    u("AVR128DB48", 0x1E970C, 131072, 512, 512, Dx),
+    u("AVR128DB64", 0x1E970B, 131072, 512, 512, Dx),
+    u("AVR16DD14", 0x1E9434, 16384, 512, 256, Dd),
+    u("AVR16DD20", 0x1E9433, 16384, 512, 256, Dd),
+    u("AVR16DD28", 0x1E9432, 16384, 512, 256, Dd),
+    u("AVR16DD32", 0x1E9431, 16384, 512, 256, Dd),
+    u("AVR32DD14", 0x1E953B, 32768, 512, 256, Dd),
+    u("AVR32DD20", 0x1E953A, 32768, 512, 256, Dd),
+    u("AVR32DD28", 0x1E9539, 32768, 512, 256, Dd),
+    u("AVR32DD32", 0x1E9538, 32768, 512, 256, Dd),
+    u("AVR64DD14", 0x1E961D, 65536, 512, 256, Dd),
+    u("AVR64DD20", 0x1E961C, 65536, 512, 256, Dd),
+    u("AVR64DD28", 0x1E961B, 65536, 512, 256, Dd),
+    u("AVR64DD32", 0x1E961A, 65536, 512, 256, Dd),
+    // AVR DA with "S" suffix (same as DA)
+    u("AVR32DA28S", 0x1E9572, 32768, 512, 512, Dx),
+    u("AVR32DA32S", 0x1E9571, 32768, 512, 512, Dx),
+    u("AVR32DA48S", 0x1E9570, 32768, 512, 512, Dx),
+    u("AVR64DA28S", 0x1E962E, 65536, 512, 512, Dx),
+    u("AVR64DA32S", 0x1E962D, 65536, 512, 512, Dx),
+    u("AVR64DA48S", 0x1E962C, 65536, 512, 512, Dx),
+    u("AVR64DA64S", 0x1E962B, 65536, 512, 512, Dx),
+    u("AVR128DA28S", 0x1E9712, 131072, 512, 512, Dx),
+    u("AVR128DA32S", 0x1E9711, 131072, 512, 512, Dx),
+    u("AVR128DA48S", 0x1E9710, 131072, 512, 512, Dx),
+    u("AVR128DA64S", 0x1E970F, 131072, 512, 512, Dx),
+    // AVR DU
+    u("AVR16DU14", 0x1E943B, 16384, 512, 256, Du),
+    u("AVR16DU20", 0x1E943A, 16384, 512, 256, Du),
+    u("AVR16DU28", 0x1E9439, 16384, 512, 256, Du),
+    u("AVR16DU32", 0x1E9438, 16384, 512, 256, Du),
+    u("AVR32DU14", 0x1E954F, 32768, 512, 256, Du),
+    u("AVR32DU20", 0x1E954E, 32768, 512, 256, Du),
+    u("AVR32DU28", 0x1E9540, 32768, 512, 256, Du),
+    u("AVR32DU32", 0x1E953F, 32768, 512, 256, Du),
+    u("AVR64DU28", 0x1E9622, 65536, 512, 256, Du),
+    u("AVR64DU32", 0x1E9621, 65536, 512, 256, Du),
+    // AVR EA
+    u("AVR8EA28", 0x1E932C, 8192, 64, 512, Ea),
+    u("AVR8EA32", 0x1E932B, 8192, 64, 512, Ea),
+    u("AVR16EA28", 0x1E9437, 16384, 64, 512, Ea),
+    u("AVR16EA32", 0x1E9436, 16384, 64, 512, Ea),
+    u("AVR16EA48", 0x1E9435, 16384, 64, 512, Ea),
+    u("AVR32EA28", 0x1E953E, 32768, 64, 512, Ea),
+    u("AVR32EA32", 0x1E953D, 32768, 64, 512, Ea),
+    u("AVR32EA48", 0x1E953C, 32768, 64, 512, Ea),
+    u("AVR64EA28", 0x1E9620, 65536, 128, 512, Ea),
+    u("AVR64EA32", 0x1E961F, 65536, 128, 512, Ea),
+    u("AVR64EA48", 0x1E961E, 65536, 128, 512, Ea),
+    // AVR EB
+    u("AVR16EB14", 0x1E9449, 16384, 64, 512, Eb),
+    u("AVR16EB20", 0x1E9440, 16384, 64, 512, Eb),
+    u("AVR16EB28", 0x1E943F, 16384, 64, 512, Eb),
+    u("AVR16EB32", 0x1E943E, 16384, 64, 512, Eb),
+    u("AVR32EB14", 0x1E952D, 32768, 64, 512, Eb),
+    u("AVR32EB20", 0x1E952C, 32768, 64, 512, Eb),
+    u("AVR32EB28", 0x1E952B, 32768, 64, 512, Eb),
+    u("AVR32EB32", 0x1E952A, 32768, 64, 512, Eb),
+];
+
+/// Every known AVR, ISP parts first.
+pub fn all_parts() -> impl Iterator<Item = &'static AvrPart> {
+    PARTS.iter().chain(UPDI_PARTS)
+}
+
 /// Part by name (case-insensitive; a package suffix after `@` is ignored).
 pub fn find(name: &str) -> Option<&'static AvrPart> {
     let base = name.split('@').next().unwrap_or(name).trim();
-    PARTS.iter().find(|p| p.name.eq_ignore_ascii_case(base))
+    all_parts().find(|p| p.name.eq_ignore_ascii_case(base))
 }
 
 /// Names of the parts with this signature.
 pub fn by_signature(sig: [u8; 3]) -> Vec<&'static str> {
-    PARTS
-        .iter()
+    all_parts()
         .filter(|p| p.signature == sig)
         .map(|p| p.name)
         .collect()
@@ -402,7 +582,13 @@ impl<'a> Isp<'a> {
     }
 
     /// Write the EEPROM bytes that differ from `old`.
-    pub fn write_eeprom(&mut self, data: &[u8], old: &[u8], progress: Progress) -> Result<()> {
+    pub fn write_eeprom(
+        &mut self,
+        _part: &AvrPart,
+        data: &[u8],
+        old: &[u8],
+        progress: Progress,
+    ) -> Result<()> {
         for (a, (&b, &o)) in data.iter().zip(old).enumerate() {
             if b != o {
                 self.exchange([0xC0, (a >> 8) as u8, a as u8, b])?;
@@ -422,12 +608,243 @@ impl<'a> Isp<'a> {
     }
 }
 
+/// A part in programming mode, on either interface.
+pub enum Link<'a> {
+    Isp(Isp<'a>),
+    Updi(crate::updi::Updi<'a>),
+}
+
+impl<'a> Link<'a> {
+    /// Fail unless the part answering is `part`. A locked UPDI part hides
+    /// its signature; only its family is checked then.
+    pub fn check(&mut self, part: &AvrPart) -> Result<()> {
+        if let Link::Updi(u) = self {
+            u.check_family(part)?;
+            if u.locked() {
+                log::info!("{} is locked; only a chip erase works", part.name);
+                return Ok(());
+            }
+        }
+        let sig = self.signature()?;
+        if sig == part.signature {
+            return Ok(());
+        }
+        let known = by_signature(sig);
+        Err(Error::Chip(format!(
+            "Signature {:02X} {:02X} {:02X} does not match {} ({})",
+            sig[0],
+            sig[1],
+            sig[2],
+            part.name,
+            if known.is_empty() {
+                "unknown part".to_string()
+            } else {
+                format!("found {}", known.join(" / "))
+            }
+        )))
+    }
+
+    pub fn isp(&mut self) -> Result<&mut Isp<'a>> {
+        match self {
+            Link::Isp(i) => Ok(i),
+            Link::Updi(_) => Err(Error::Chip("This part is programmed over UPDI".into())),
+        }
+    }
+
+    pub fn updi(&mut self) -> Result<&mut crate::updi::Updi<'a>> {
+        match self {
+            Link::Updi(u) => Ok(u),
+            Link::Isp(_) => Err(Error::Chip("This part is programmed over ISP".into())),
+        }
+    }
+
+    pub fn signature(&mut self) -> Result<[u8; 3]> {
+        match self {
+            Link::Isp(i) => i.signature(),
+            Link::Updi(u) => u.signature(),
+        }
+    }
+
+    pub fn chip_erase(&mut self) -> Result<()> {
+        match self {
+            Link::Isp(i) => i.chip_erase(),
+            Link::Updi(u) => u.chip_erase(),
+        }
+    }
+
+    pub fn read_flash(&mut self, part: &AvrPart, progress: Progress) -> Result<Vec<u8>> {
+        match self {
+            Link::Isp(i) => i.read_flash(part, progress),
+            Link::Updi(u) => u.read_flash(part, progress),
+        }
+    }
+
+    pub fn read_eeprom(&mut self, part: &AvrPart, progress: Progress) -> Result<Vec<u8>> {
+        match self {
+            Link::Isp(i) => i.read_eeprom(part, progress),
+            Link::Updi(u) => u.read_eeprom(part, progress),
+        }
+    }
+
+    pub fn write_flash(&mut self, part: &AvrPart, data: &[u8], progress: Progress) -> Result<()> {
+        match self {
+            Link::Isp(i) => i.write_flash(part, data, progress),
+            Link::Updi(u) => u.write_flash(part, data, progress),
+        }
+    }
+
+    pub fn write_eeprom(
+        &mut self,
+        part: &AvrPart,
+        data: &[u8],
+        old: &[u8],
+        progress: Progress,
+    ) -> Result<()> {
+        match self {
+            Link::Isp(i) => i.write_eeprom(part, data, old, progress),
+            Link::Updi(u) => u.write_eeprom(part, data, old, progress),
+        }
+    }
+
+    pub fn release(&mut self) -> Result<()> {
+        match self {
+            Link::Isp(i) => i.release(),
+            Link::Updi(u) => u.release(),
+        }
+    }
+
+    /// All fuse bytes of `part` and its lock state.
+    pub fn read_fuses(&mut self, part: &AvrPart) -> Result<FuseValues> {
+        let layout = fuse_layout(part);
+        let (raw, lock) = match self {
+            Link::Isp(i) => {
+                let f = i.fuses(part.fuses)?;
+                let mut raw = vec![f.low, f.high];
+                raw.extend(f.extended);
+                (raw, format!("0x{:02X}", f.lock))
+            }
+            Link::Updi(u) => {
+                let raw = u.fuses()?;
+                let lock = u.lock_bits()?;
+                let open = matches!(lock, 0xC5 | 0x5CC5_C55C);
+                let lock = if lock > 0xFF {
+                    format!("0x{lock:08X}")
+                } else {
+                    format!("0x{lock:02X}")
+                };
+                (
+                    raw,
+                    if open {
+                        format!("{lock} (unlocked)")
+                    } else {
+                        format!("{lock} (locked)")
+                    },
+                )
+            }
+        };
+        Ok(FuseValues {
+            fuses: layout.into_iter().map(|(i, n)| (i, n, raw[i])).collect(),
+            lock,
+        })
+    }
+
+    /// Program fuse bytes, given as (index from [`fuse_layout`], value).
+    pub fn write_fuses(&mut self, part: &AvrPart, values: &[(usize, u8)]) -> Result<()> {
+        let layout = fuse_layout(part);
+        for &(i, _) in values {
+            if !layout.iter().any(|&(j, _)| j == i) {
+                return Err(Error::Chip(format!("{} has no fuse {i}", part.name)));
+            }
+        }
+        match self {
+            Link::Isp(isp) => {
+                let get = |n| values.iter().find(|&&(i, _)| i == n).map(|&(_, v)| v);
+                isp.write_fuses(get(0), get(1), get(2), None)
+            }
+            Link::Updi(u) => {
+                for &(i, v) in values {
+                    u.write_fuse(part, i, v)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Fuse bytes read from a part: (index, name, value) and the lock state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FuseValues {
+    pub fuses: Vec<(usize, &'static str, u8)>,
+    pub lock: String,
+}
+
+/// The fuse bytes of `part` as (index, name). The index is what
+/// [`Link::write_fuses`] takes.
+pub fn fuse_layout(part: &AvrPart) -> Vec<(usize, &'static str)> {
+    match part.bus {
+        Bus::Isp => {
+            let names: &[&str] = if part.fuses > 2 {
+                &["Low", "High", "Extended"]
+            } else {
+                &["Low", "High"]
+            };
+            names.iter().copied().enumerate().collect()
+        }
+        Bus::Updi(f) => {
+            let mut v = vec![(0, "WDTCFG"), (1, "BODCFG"), (2, "OSCCFG")];
+            if f == UpdiFamily::Tiny {
+                v.push((4, "TCD0CFG"));
+            }
+            v.extend([(5, "SYSCFG0"), (6, "SYSCFG1")]);
+            match f {
+                UpdiFamily::Tiny | UpdiFamily::Mega0 => v.extend([(7, "APPEND"), (8, "BOOTEND")]),
+                _ => v.extend([(7, "CODESIZE"), (8, "BOOTSIZE")]),
+            }
+            v
+        }
+    }
+}
+
 fn plausible(sig: [u8; 3]) -> bool {
     sig[0] == 0x1E && sig != [0x1E, 0xFF, 0xFF] && sig != [0x1E, 0x00, 0x00]
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn newer_updi_families() {
+        let fam = |n| match find(n).unwrap().bus {
+            Bus::Updi(f) => f,
+            Bus::Isp => panic!("{n} is not UPDI"),
+        };
+        assert_eq!(fam("AVR16EA28"), UpdiFamily::Ea);
+        assert_eq!(fam("AVR32EB32"), UpdiFamily::Eb);
+        assert_eq!(fam("AVR64DU32"), UpdiFamily::Du);
+        assert_eq!(fam("AVR128DA48S"), UpdiFamily::Dx);
+        assert_eq!(by_signature([0x1E, 0x94, 0x37]), ["AVR16EA28"]);
+    }
+
+    #[test]
+    fn fuse_layouts() {
+        let names = |n| -> Vec<&str> {
+            fuse_layout(find(n).unwrap())
+                .into_iter()
+                .map(|f| f.1)
+                .collect()
+        };
+        assert_eq!(names("ATmega328P"), ["Low", "High", "Extended"]);
+        assert_eq!(
+            names("ATtiny212"),
+            ["WDTCFG", "BODCFG", "OSCCFG", "TCD0CFG", "SYSCFG0", "SYSCFG1", "APPEND", "BOOTEND"]
+        );
+        // index 3 is reserved on every UPDI part
+        for p in all_parts().filter(|p| p.bus != Bus::Isp) {
+            assert!(fuse_layout(p)
+                .iter()
+                .all(|f| f.0 != 3 && f.0 < crate::updi::FUSES));
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -435,8 +852,20 @@ mod tests {
         let p = find("ATMEGA328P@DIP28").unwrap();
         assert_eq!(p.signature, [0x1E, 0x95, 0x0F]);
         assert_eq!(by_signature([0x1E, 0x93, 0x0B]), vec!["ATtiny85"]);
-        for p in PARTS {
+        for p in all_parts() {
             assert_eq!(p.flash % p.page as u32, 0, "{}", p.name);
+            assert!(!by_signature(p.signature).is_empty());
+        }
+        let t = find("attiny1614").unwrap();
+        assert_eq!(t.bus, Bus::Updi(UpdiFamily::Tiny));
+        assert_eq!(by_signature([0x1E, 0x94, 0x22]), vec!["ATtiny1614"]);
+        // UPDI signatures never collide with ISP parts
+        for u in UPDI_PARTS {
+            assert!(
+                PARTS.iter().all(|p| p.signature != u.signature),
+                "{}",
+                u.name
+            );
         }
     }
 }

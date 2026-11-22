@@ -89,9 +89,17 @@ enum Cmd {
     Erase,
     /// Check whether the chip is blank (all 0xFF).
     Blank,
-    /// Show (or program) the fuse and lock bytes of an AVR on the ISP
-    /// header. Without --chip the part is identified by its signature.
+    /// Show (or program) the fuse and lock bytes of an AVR. Without --chip
+    /// the part is identified by its signature (over ISP, or UPDI with
+    /// --updi).
     Fuses {
+        /// Talk UPDI instead of ISP when no --chip is given.
+        #[arg(long)]
+        updi: bool,
+        /// UPDI parts: program fuse N (0 = WDTCFG … 8 = BOOTEND/BOOTSIZE),
+        /// e.g. --set 1=0x00. May be repeated.
+        #[arg(long, value_parser = parse_fuse)]
+        set: Vec<(usize, u8)>,
         /// New low fuse byte, e.g. 0xE2.
         #[arg(long, value_parser = parse_byte)]
         low: Option<u8>,
@@ -122,8 +130,21 @@ fn parse_byte(s: &str) -> std::result::Result<u8, String> {
     u8::from_str_radix(t, 16).map_err(|_| format!("{s} is not a hex byte"))
 }
 
+fn parse_fuse(s: &str) -> std::result::Result<(usize, u8), String> {
+    let (i, v) = s
+        .split_once('=')
+        .ok_or_else(|| format!("{s}: expected N=0xVV"))?;
+    let i = i
+        .trim()
+        .parse()
+        .map_err(|_| format!("{i} is not a fuse number"))?;
+    Ok((i, parse_byte(v)?))
+}
+
 fn run_fuses(cli: &Cli) -> Result<()> {
     let Cmd::Fuses {
+        updi,
+        ref set,
         low,
         high,
         extended,
@@ -132,6 +153,7 @@ fn run_fuses(cli: &Cli) -> Result<()> {
     else {
         unreachable!()
     };
+    let isp_args = [low, high, extended, lock].iter().any(Option::is_some);
     let mut p = Programmer::connect_with_log(Box::new(|m| eprintln!("{m}")))?;
     let part = match target(cli)? {
         Some(Driver::Avr(part, _)) => part,
@@ -140,8 +162,12 @@ fn run_fuses(cli: &Cli) -> Result<()> {
                 "Fuses exist on AVR microcontrollers only".into(),
             ))
         }
-        None if [low, high, extended, lock].iter().all(Option::is_none) => {
-            println!("{}", p.avr_identify()?);
+        None if !isp_args && set.is_empty() => {
+            if updi {
+                println!("{}", p.updi_identify()?);
+            } else {
+                println!("{}", p.avr_identify()?);
+            }
             return Ok(());
         }
         None => {
@@ -150,10 +176,39 @@ fn run_fuses(cli: &Cli) -> Result<()> {
             ))
         }
     };
+    if let rt809h_core::avr::Bus::Updi(_) = part.bus {
+        if isp_args {
+            return Err(Error::Chip(format!(
+                "{} has numbered fuses; use --set N=0xVV",
+                part.name
+            )));
+        }
+        if set.is_empty() {
+            println!("{}", p.updi_identify()?);
+            return Ok(());
+        }
+        let f = p.with_avr(part, |l| {
+            let u = l.updi()?;
+            for &(i, v) in set {
+                u.write_fuse(part, i, v)?;
+            }
+            u.fuses()
+        })?;
+        let f: Vec<String> = f.iter().map(|b| format!("{b:02X}")).collect();
+        println!("{}: fuses {}", part.name, f.join(" "));
+        return Ok(());
+    }
+    if !set.is_empty() {
+        return Err(Error::Chip(format!(
+            "{} has low/high/extended fuses; use --low/--high/--extended",
+            part.name
+        )));
+    }
     if extended.is_some() && part.fuses < 3 {
         return Err(Error::Chip(format!("{} has no extended fuse", part.name)));
     }
-    let f = p.with_avr(part, |i| {
+    let f = p.with_avr(part, |l| {
+        let i = l.isp()?;
         i.write_fuses(low, high, extended, lock)?;
         i.fuses(part.fuses)
     })?;

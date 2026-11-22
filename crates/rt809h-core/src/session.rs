@@ -371,6 +371,9 @@ impl Programmer {
                     s.size
                 )
             }
+            Driver::Avr(p, _) if matches!(p.bus, crate::avr::Bus::Updi(_)) => {
+                self.updi_identify()?
+            }
             Driver::Avr(..) => self.avr_identify()?,
             Driver::Ene(p) => {
                 self.with_ene(p, |_| Ok(()))?;
@@ -462,7 +465,7 @@ impl Programmer {
             }),
             Driver::Avr(p, crate::avr::Memory::Eeprom) => self.with_avr(p, |i| {
                 let old = i.read_eeprom(p, &mut |_, _| true)?;
-                i.write_eeprom(data, &old, progress)
+                i.write_eeprom(p, data, &old, progress)
             }),
             Driver::Spi(_) => Err(Error::Chip("SPI NOR flash: use with_flash".into())),
         }
@@ -591,79 +594,137 @@ impl Programmer {
 }
 
 impl Programmer {
-    /// Power the ISP header, enter programming mode on `part` (its
-    /// signature must match) and run `f`. The part is released afterwards.
-    pub fn with_avr<T>(
+    /// Open the link (`updi`: UPDI on the socket's MOSI/MISO contacts,
+    /// otherwise SPI serial programming on the ISP header) and run `f`. The part is
+    /// released afterwards.
+    pub fn with_link<T>(
         &mut self,
-        part: &crate::avr::AvrPart,
-        f: impl FnOnce(&mut crate::avr::Isp) -> Result<T>,
+        updi: bool,
+        f: impl FnOnce(&mut crate::avr::Link) -> Result<T>,
     ) -> Result<T> {
-        self.mcu.enter_isp()?;
+        use crate::avr::Link;
+        if updi {
+            // UPDI runs on MOSI/MISO in the socket's SPI routing, 3.3 V on 28
+            self.power_spi(Voltage::V3_3)?;
+            self.mcu
+                .ftdi
+                .set_bitmode(0xFF, crate::ftdi::BitMode::Reset)?;
+            self.mcu
+                .ftdi
+                .set_bitmode(0xFF, crate::ftdi::BitMode::Mpsse)?;
+        } else {
+            self.mcu.enter_isp()?;
+        }
         let res = (|| {
-            let mut isp = crate::avr::Isp::enter(&mut self.mcu.ftdi)?;
-            let r = (|| {
-                let sig = isp.signature()?;
-                if sig != part.signature {
-                    let known = crate::avr::by_signature(sig);
-                    return Err(Error::Chip(format!(
-                        "Signature {:02X} {:02X} {:02X} does not match {} ({})",
-                        sig[0],
-                        sig[1],
-                        sig[2],
-                        part.name,
-                        if known.is_empty() {
-                            "unknown part".to_string()
-                        } else {
-                            format!("found {}", known.join(" / "))
-                        }
-                    )));
-                }
-                f(&mut isp)
-            })();
-            let _ = isp.release();
+            let mut link = if updi {
+                Link::Updi(crate::updi::Updi::enter(&mut self.mcu.ftdi)?)
+            } else {
+                Link::Isp(crate::avr::Isp::enter(&mut self.mcu.ftdi)?)
+            };
+            let r = f(&mut link);
+            let _ = link.release();
             r
         })();
-        let off = self.mcu.leave_isp();
+        let off = if updi {
+            self.mcu.power_off(true)
+        } else {
+            self.mcu.leave_isp()
+        };
         let v = res?;
         off?;
         Ok(v)
     }
 
+    /// Enter programming mode on `part` (its signature must match) and run
+    /// `f`.
+    pub fn with_avr<T>(
+        &mut self,
+        part: &crate::avr::AvrPart,
+        f: impl FnOnce(&mut crate::avr::Link) -> Result<T>,
+    ) -> Result<T> {
+        let updi = matches!(part.bus, crate::avr::Bus::Updi(_));
+        self.with_link(updi, |l| {
+            l.check(part)?;
+            f(l)
+        })
+    }
+
+    /// Read the fuse bytes and lock state of `part`.
+    pub fn avr_read_fuses(&mut self, part: &crate::avr::AvrPart) -> Result<crate::avr::FuseValues> {
+        self.with_avr(part, |l| l.read_fuses(part))
+    }
+
+    /// Program fuse bytes (index, value) of `part` and read all of them back.
+    pub fn avr_write_fuses(
+        &mut self,
+        part: &crate::avr::AvrPart,
+        values: &[(usize, u8)],
+    ) -> Result<crate::avr::FuseValues> {
+        self.with_avr(part, |l| {
+            l.write_fuses(part, values)?;
+            l.read_fuses(part)
+        })
+    }
+
     /// Identify the AVR on the ISP header: signature, matching part names,
     /// fuses and the ISP clock that works.
     pub fn avr_identify(&mut self) -> Result<String> {
-        self.mcu.enter_isp()?;
-        let res = (|| {
-            let mut isp = crate::avr::Isp::enter(&mut self.mcu.ftdi)?;
-            let r = (|| -> Result<String> {
-                let sig = isp.signature()?;
-                let names = crate::avr::by_signature(sig);
-                let fuse_count = names
-                    .first()
-                    .and_then(|n| crate::avr::find(n))
-                    .map_or(3, |p| p.fuses);
-                let fuses = isp.fuses(fuse_count)?;
-                Ok(format!(
-                    "Signature {:02X} {:02X} {:02X} ({}), {}, ISP clock {} kHz",
-                    sig[0],
-                    sig[1],
-                    sig[2],
-                    if names.is_empty() {
-                        "unknown part".to_string()
-                    } else {
-                        names.join(" / ")
-                    },
-                    fuses,
-                    isp.clock_hz() / 1000
-                ))
-            })();
-            let _ = isp.release();
-            r
-        })();
-        let off = self.mcu.leave_isp();
-        let v = res?;
-        off?;
-        Ok(v)
+        self.with_link(false, |l| {
+            let isp = l.isp()?;
+            let sig = isp.signature()?;
+            let names = crate::avr::by_signature(sig);
+            let fuse_count = names
+                .first()
+                .and_then(|n| crate::avr::find(n))
+                .map_or(3, |p| p.fuses);
+            let fuses = isp.fuses(fuse_count)?;
+            Ok(format!(
+                "Signature {:02X} {:02X} {:02X} ({}), {}, ISP clock {} kHz",
+                sig[0],
+                sig[1],
+                sig[2],
+                names_or_unknown(&names),
+                fuses,
+                isp.clock_hz() / 1000
+            ))
+        })
+    }
+
+    /// Identify the AVR on UPDI: family, signature, fuses and lock bits.
+    pub fn updi_identify(&mut self) -> Result<String> {
+        self.with_link(true, |l| {
+            let u = l.updi()?;
+            let head = format!("UPDI: {} (NVM P:{})", u.family_name(), u.nvm_version());
+            if u.locked() {
+                return Ok(format!(
+                    "{head}, locked: erase it to read or program it (this also clears flash \
+                     and EEPROM)"
+                ));
+            }
+            let sig = u.signature()?;
+            let fuses = u.fuses()?;
+            let lock = u.lock_bits()?;
+            Ok(format!(
+                "{head}, signature {:02X} {:02X} {:02X} ({}), fuses {}, lock 0x{lock:02X}",
+                sig[0],
+                sig[1],
+                sig[2],
+                names_or_unknown(&crate::avr::by_signature(sig)),
+                fuses
+                    .iter()
+                    .map(|b| format!("{b:02X}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ))
+        })
+    }
+}
+
+fn names_or_unknown(names: &[&str]) -> String {
+    if names.is_empty() {
+        "unknown part".to_string()
+    } else {
+        names.join(" / ")
     }
 }
 

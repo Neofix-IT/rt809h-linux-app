@@ -13,6 +13,7 @@ pub mod session;
 pub mod spi;
 pub mod spi_eeprom;
 pub mod spi_nand;
+pub mod updi;
 pub mod vendor_db;
 
 pub use protocol::Voltage;
