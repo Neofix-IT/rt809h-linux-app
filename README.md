@@ -4,7 +4,9 @@ Native Linux app and command line tool for the **RT809H** universal programmer.
 No Wine, no Windows software, no proprietary libraries — the programmer is
 driven directly over USB (pure Rust, no libusb/libftdi needed).
 
-![status](https://img.shields.io/badge/status-early-orange)
+> **Unofficial project.** This app is not made, endorsed or supported by the
+> manufacturer of the RT809H. Use it at your own risk; for official support
+> use the vendor's Windows software.
 
 ## Features
 
@@ -17,8 +19,17 @@ driven directly over USB (pure Rust, no libusb/libftdi needed).
 - Unknown chips are handled through SFDP / JEDEC capacity
 - Simple English GUI with hex preview, plus a scriptable CLI
 
-Currently supported: 25-series SPI NOR flash in the ZIF socket (8-pin, pushed
-to the bottom of the socket). See `rt809h chips` for the database.
+## What is supported
+
+The app currently covers **SPI flashing only**: 25-series SPI NOR flash in the
+ZIF socket (8-pin, pushed to the bottom of the socket). See `rt809h chips` for
+the chip database; unknown 25-series chips are sized through SFDP/JEDEC.
+
+The RT809H itself supports many more protocols and chip families (I²C 24xx
+EEPROMs, Microwire 93xx, parallel NOR/EPROM, NAND, eMMC, MCUs, ISP, …). These
+are **not supported yet**. Adding them is possible, but each family needs its
+own protocol work and testing with real chips, so contributions and test
+reports are welcome.
 
 ## Install
 
