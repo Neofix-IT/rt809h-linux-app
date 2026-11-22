@@ -13,6 +13,15 @@ const MAX_XFER: usize = 65536;
 
 pub struct SpiBus<'a> {
     ftdi: &'a mut Ftdi,
+    hz: u32,
+}
+
+/// One chip-select cycle of a batched transfer.
+pub struct Frame<'b> {
+    pub out: &'b [u8],
+    pub in_len: usize,
+    /// idle clocks after CS# goes high, in microseconds
+    pub delay_us: u32,
 }
 
 impl<'a> SpiBus<'a> {
@@ -20,7 +29,7 @@ impl<'a> SpiBus<'a> {
     pub fn init(ftdi: &'a mut Ftdi, hz: u32) -> Result<Self> {
         ftdi.set_bitmode(0xFF, BitMode::Reset)?;
         ftdi.set_bitmode(0xFF, BitMode::Mpsse)?;
-        let mut bus = Self { ftdi };
+        let mut bus = Self { ftdi, hz };
         bus.set_speed(hz)?;
         Ok(bus)
     }
@@ -28,6 +37,7 @@ impl<'a> SpiBus<'a> {
     pub fn set_speed(&mut self, hz: u32) -> Result<()> {
         // 60 MHz base clock: f = 60 MHz / (2 * (div + 1))
         let div = (60_000_000 / (2 * hz.max(1))).saturating_sub(1).min(0xFFFF) as u16;
+        self.hz = 30_000_000 / (div as u32 + 1);
         let mut c = vec![0x8A, 0x97, 0x8D, 0x86, div as u8, (div >> 8) as u8];
         c.extend_from_slice(&CS_HIGH);
         self.ftdi.write(&c)
@@ -77,6 +87,36 @@ impl<'a> SpiBus<'a> {
             c.extend_from_slice(&CS_HIGH);
         }
         self.ftdi.write(&c)
+    }
+
+    /// Several chip-select cycles in one USB round trip; returns all bytes
+    /// clocked in, in order.
+    pub fn batch(&mut self, frames: &[Frame]) -> Result<Vec<u8>> {
+        let mut c = Vec::new();
+        let mut total = 0;
+        for f in frames {
+            c.extend_from_slice(&CS_LOW);
+            Self::push_out(&mut c, f.out);
+            Self::push_in(&mut c, f.in_len);
+            c.extend_from_slice(&CS_HIGH);
+            total += f.in_len;
+            // clock without data to wait (8 clocks per count)
+            let mut bytes = (f.delay_us as u64 * self.hz as u64 / 8_000_000) as usize;
+            while bytes > 0 {
+                let n = bytes.min(65536);
+                c.extend_from_slice(&[0x8F, (n - 1) as u8, ((n - 1) >> 8) as u8]);
+                bytes -= n;
+            }
+        }
+        if total > 0 {
+            c.push(0x87);
+        }
+        self.ftdi.write(&c)?;
+        if total > 0 {
+            self.ftdi.read_exact(total)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     /// Long read with the command/address sent once and data streamed.

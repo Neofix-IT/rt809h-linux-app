@@ -326,6 +326,55 @@ impl Programmer {
 }
 
 impl Programmer {
+    /// Power a 25xx SPI EEPROM and run `f` on it.
+    pub fn with_spi_eeprom<T>(
+        &mut self,
+        size: u32,
+        f: impl FnOnce(&mut crate::spi_eeprom::SpiEeprom) -> Result<T>,
+    ) -> Result<T> {
+        self.power_spi(Voltage::V3_3)?;
+        let res = (|| {
+            let bus = SpiBus::init(&mut self.mcu.ftdi, 2_000_000)?;
+            let mut e = crate::spi_eeprom::SpiEeprom::new(bus, size)?;
+            f(&mut e)
+        })();
+        let off = self.mcu.power_off(true);
+        let v = res?;
+        off?;
+        Ok(v)
+    }
+
+    /// Power an SPI NAND flash, check its ID (if one is given) and run `f`.
+    pub fn with_spi_nand<T>(
+        &mut self,
+        voltage: Voltage,
+        geo: crate::spi_nand::NandGeometry,
+        id: Option<[u8; 2]>,
+        f: impl FnOnce(&mut crate::spi_nand::Nand) -> Result<T>,
+    ) -> Result<T> {
+        self.power_spi(voltage)?;
+        let hz = self.spi_hz;
+        let res = (|| {
+            let mut bus = SpiBus::init(&mut self.mcu.ftdi, ID_HZ)?;
+            let got = crate::spi_nand::read_id(&mut bus)?;
+            if let Some(want) = id {
+                if got != want {
+                    return Err(Error::Chip(format!(
+                        "SPI NAND ID {:02X} {:02X} does not match the selected part ({:02X} {:02X})",
+                        got[0], got[1], want[0], want[1]
+                    )));
+                }
+            }
+            bus.set_speed(hz)?;
+            let mut nand = crate::spi_nand::Nand::new(bus, geo)?;
+            f(&mut nand)
+        })();
+        let off = self.mcu.power_off(true);
+        let v = res?;
+        off?;
+        Ok(v)
+    }
+
     /// Power a 24xx I2C EEPROM of `size` bytes and run `f` on it. The socket
     /// is always switched off afterwards.
     pub fn with_eeprom<T>(

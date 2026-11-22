@@ -8,6 +8,8 @@ pub mod image;
 pub mod protocol;
 pub mod session;
 pub mod spi;
+pub mod spi_eeprom;
+pub mod spi_nand;
 
 pub use protocol::Voltage;
 pub use session::{DetectedChip, Programmer};
