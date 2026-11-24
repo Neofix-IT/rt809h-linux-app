@@ -126,7 +126,16 @@ struct Running {
     started: Instant,
 }
 
+/// Outcome of a file dialog run off the UI thread.
+enum FileDone {
+    Opened(std::path::PathBuf, std::io::Result<Vec<u8>>),
+    Saved(std::path::PathBuf, std::io::Result<()>),
+}
+
 struct App {
+    ctx: egui::Context,
+    /// a file dialog (and its read or write) is running in the background
+    file_op: Option<Receiver<FileDone>>,
     jobs: Sender<Job>,
     events: Receiver<Event>,
     cancel: Arc<AtomicBool>,
@@ -176,6 +185,8 @@ impl App {
         );
         std::thread::spawn(move || w.run());
         let mut app = Self {
+            ctx: ctx.clone(),
+            file_op: None,
             jobs: jtx,
             events: erx,
             cancel,
@@ -343,7 +354,12 @@ impl App {
     }
 
     fn load_path(&mut self, path: &std::path::Path) {
-        match std::fs::read(path) {
+        let r = std::fs::read(path);
+        self.loaded(path, r);
+    }
+
+    fn loaded(&mut self, path: &std::path::Path, r: std::io::Result<Vec<u8>>) {
+        match r {
             Ok(d) => {
                 self.push_log(
                     LogKind::Info,
@@ -360,14 +376,56 @@ impl App {
         }
     }
 
-    fn open_file(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Binary images", &["bin", "rom", "img", "BIN", "ROM"])
-            .add_filter("All files", &["*"])
-            .pick_file()
-        {
-            self.load_path(&path);
+    /// Run `f` (a file dialog plus its I/O) on its own thread so the window
+    /// keeps drawing; the result is picked up in `poll_file`.
+    fn file_task(&mut self, f: impl FnOnce() -> Option<FileDone> + Send + 'static) {
+        if self.file_op.is_some() {
+            return;
         }
+        let (tx, rx) = channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            if let Some(done) = f() {
+                let _ = tx.send(done);
+            }
+            ctx.request_repaint();
+        });
+        self.file_op = Some(rx);
+    }
+
+    fn poll_file(&mut self) {
+        let Some(rx) = &self.file_op else { return };
+        let done = match rx.try_recv() {
+            Ok(d) => Some(d),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.file_op = None;
+        match done {
+            Some(FileDone::Opened(path, r)) => self.loaded(&path, r),
+            Some(FileDone::Saved(path, Ok(()))) => {
+                let m = format!("Saved {}", path.display());
+                self.push_log(LogKind::Ok, m.clone());
+                self.status = Some((true, m));
+            }
+            Some(FileDone::Saved(_, Err(e))) => {
+                let m = format!("Cannot save: {e}");
+                self.push_log(LogKind::Error, m.clone());
+                self.status = Some((false, m));
+            }
+            None => {}
+        }
+    }
+
+    fn open_file(&mut self) {
+        self.file_task(|| {
+            let path = rfd::FileDialog::new()
+                .add_filter("Binary images", &["bin", "rom", "img", "BIN", "ROM"])
+                .add_filter("All files", &["*"])
+                .pick_file()?;
+            let r = std::fs::read(&path);
+            Some(FileDone::Opened(path, r))
+        });
     }
 
     fn save_file(&mut self) {
@@ -377,24 +435,14 @@ impl App {
             None => "dump.bin".into(),
         };
         let data = buf.data.clone();
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Binary images", &["bin"])
-            .set_file_name(default)
-            .save_file()
-        {
-            match std::fs::write(&path, data.as_slice()) {
-                Ok(()) => {
-                    let m = format!("Saved {}", path.display());
-                    self.push_log(LogKind::Ok, m.clone());
-                    self.status = Some((true, m));
-                }
-                Err(e) => {
-                    let m = format!("Cannot save: {e}");
-                    self.push_log(LogKind::Error, m.clone());
-                    self.status = Some((false, m));
-                }
-            }
-        }
+        self.file_task(move || {
+            let path = rfd::FileDialog::new()
+                .add_filter("Binary images", &["bin"])
+                .set_file_name(default)
+                .save_file()?;
+            let r = std::fs::write(&path, data.as_slice());
+            Some(FileDone::Saved(path, r))
+        });
     }
 
     fn handle_input(&mut self, ctx: &egui::Context) {
@@ -1447,6 +1495,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.poll();
+        self.poll_file();
         let ctx = ui.ctx().clone();
         self.handle_input(&ctx);
         let p = Palette::of(ui);
